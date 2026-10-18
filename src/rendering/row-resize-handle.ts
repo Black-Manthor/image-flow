@@ -4,7 +4,7 @@ import { rowAtPosition } from '../markdown/row-actions';
 import { REFERENCE_WIDTH, type ImageRow } from '../markdown/row-model';
 import { rowDefaults, type ImageSettings } from '../settings';
 import { applyRow, naturalWidth } from './row-layout';
-import { rowHeightEffect } from './row-height';
+import { rowHeightEffect, rowHeightOf } from './row-height';
 import { composedWidths, resizedWidth, withWidth } from './row-resize';
 import { previewStart } from './preview-dom';
 import { notify } from '../ui/notify';
@@ -82,7 +82,7 @@ function save(root: HTMLElement, row: ImageRow, index: number, width: number, vi
 	}
 	// The row's new height (the preview showed the final composition) goes with
 	// the change: one transaction, so CodeMirror does not redraw the row twice.
-	const height = Math.round(root.getBoundingClientRect().height);
+	const height = rowHeightOf(root);
 	view.dispatch({ changes: { from: current.from + image.from, to: current.from + image.to, insert: withWidth(image.raw, width) },
 		effects: rowHeightEffect.of({ line: current.from, height }),
 		userEvent: 'input.iw-resize', annotations: isolateHistory.of('full') });

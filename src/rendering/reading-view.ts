@@ -2,11 +2,12 @@ import { findRows, type ImageRow } from '../markdown/row-model';
 import { watchRow } from './row-layout';
 import { MarkdownRenderChild, type MarkdownPostProcessorContext, type Plugin } from 'obsidian';
 import { annotatePreviewSection, windowOf } from './preview-dom';
-import { firstParagraph, flattenImageParagraph, imageEmbeds } from './image-layout';
+import { firstParagraph, ensureImageCarrier, imageEmbeds, restoreImageParagraphs } from './image-layout';
 import { firstTextLine, imageClass, parseDocument, regionForImage, wrapImage, type DocumentModel } from '../markdown/model';
 import { applyExportLayout, stopExportRetries } from './reading-export';
 import { ownedWrapRole, renderReadingWrap } from './reading-wrap';
 import { rowDefaults, type ImageSettings } from '../settings';
+import { ReadingRefreshQueue } from './reading-refresh';
 
 // Export/print gives the whole document as one postprocessor call, with no
 // section info: see reading-export.ts for how regions are found in that case.
@@ -84,21 +85,14 @@ export function registerReadingView(plugin: Plugin, getSettings: () => ImageSett
 	// re-read when they change (checking every open note cost 11-46 ms per
 	// pass with six notes, measured in Obsidian in 0.26.4).
 	const sectionRefreshers = new Map<string, Set<() => void>>();
-	const pending = new Set<string>();
-	let refreshTimers: number[] = [];
 	const runRefreshers = (paths: Iterable<string> | 'all') => {
 		const groups = paths === 'all' ? Array.from(sectionRefreshers.values())
 			: Array.from(paths, path => sectionRefreshers.get(path)).filter(group => group !== undefined);
 		for (const group of groups) for (const refresh of Array.from(group)) refresh();
 	};
+	const refreshQueue = new ReadingRefreshQueue(path => runRefreshers([path]));
 	const scheduleRefresh = (path: string | undefined) => {
-		if (path === undefined) return;
-		pending.add(path);
-		for (const timer of refreshTimers) window.clearTimeout(timer);
-		refreshTimers = [50, 500].map((delay, index) => window.setTimeout(() => {
-			runRefreshers(pending);
-			if (index === 1) pending.clear();
-		}, delay));
+		if (loaded && path !== undefined && sectionRefreshers.has(path)) refreshQueue.schedule(path);
 	};
 	// A section shown again (switching to Reading view, its tab coming back) is
 	// checked in the frame that shows it: after layout, before paint. A change
@@ -117,15 +111,33 @@ export function registerReadingView(plugin: Plugin, getSettings: () => ImageSett
 		}
 		// No width: hidden (display: none, a view or tab in the background).
 		let shown = false;
-		onShown.set(element, now => { if (now && !shown) check(); shown = now; });
-		observer.observe(element);
+		const onChange = (now: boolean) => { if (now && !shown) check(); shown = now; };
+		onShown.set(element, onChange);
+		// Observed from the next frame. A section shown again is processed anew
+		// from within this observer's own notification, which stops observing it
+		// and lays it out anew in that very frame: observing it again there is
+		// reported by the browser as "ResizeObserver loop completed with
+		// undelivered notifications". Only its first notification comes
+		// a frame later; a section cleaned up first is never observed.
 		const watching = observer;
-		return () => { watching.unobserve(element); onShown.delete(element); };
+		let frame: number | undefined = win.requestAnimationFrame(() => {
+			frame = undefined;
+			if (onShown.get(element) === onChange) watching.observe(element);
+		});
+		return () => {
+			if (frame !== undefined) win.cancelAnimationFrame(frame);
+			frame = undefined;
+			// A newer watch of the same element owns its observation.
+			if (onShown.get(element) !== onChange) return;
+			watching.unobserve(element);
+			onShown.delete(element);
+		};
 	};
 	const activePath = () => plugin.app.workspace.getActiveFile()?.path;
 	// False once unloaded: an export still reading its note then stops there.
 	let loaded = true;
-	plugin.register(() => { loaded = false; stopExportRetries(); for (const timer of refreshTimers) window.clearTimeout(timer); });
+	plugin.register(() => { loaded = false; stopExportRetries(); refreshQueue.stop(); });
+	plugin.registerEvent(plugin.app.workspace.on('editor-change', (_, info) => scheduleRefresh(info.file?.path)));
 	plugin.registerEvent(plugin.app.vault.on('modify', file => scheduleRefresh(file.path)));
 	plugin.registerEvent(plugin.app.metadataCache.on('changed', file => scheduleRefresh(file.path)));
 	plugin.registerEvent(plugin.app.workspace.on('layout-change', () => scheduleRefresh(activePath())));
@@ -143,7 +155,9 @@ export function registerReadingView(plugin: Plugin, getSettings: () => ImageSett
 		const host = hostFor(element, context);
 		const initialModel = modelFor(initial.text);
 		const key = sectionKey(initial);
+		let current = true;
 		const refreshSection = () => {
+			if (!loaded || !current || !element.isConnected) return;
 			const info = context.getSectionInfo(element);
 			if (info && sectionKey(info) !== key) void process(element, context);
 		};
@@ -151,8 +165,12 @@ export function registerReadingView(plugin: Plugin, getSettings: () => ImageSett
 		sectionRefreshers.set(context.sourcePath, group);
 		group.add(refreshSection);
 		host.cleanups.push(() => {
+			current = false;
 			group.delete(refreshSection);
 			if (!group.size && sectionRefreshers.get(context.sourcePath) === group) sectionRefreshers.delete(context.sourcePath);
+			// Reprocessing replaces the group synchronously; only a closed last
+			// section should cancel the note's remaining retries.
+			queueMicrotask(() => { if (!sectionRefreshers.has(context.sourcePath)) refreshQueue.cancel(context.sourcePath); });
 			element.classList.remove('iw-marker-hidden', 'iw-section-hidden');
 		});
 		// Processed again with the new key when it changed: the timers then find it current.
@@ -214,7 +232,7 @@ export function registerReadingView(plugin: Plugin, getSettings: () => ImageSett
 				const region = regionForImage(model, image);
 				if (embed && cls && region && info.lineStart >= region.start && info.lineEnd <= region.end) {
 					add(embed, cls);
-					flattenImageParagraph(embed, add);
+					ensureImageCarrier(embed, add);
 				}
 			});
 			for (const region of model.regions) {
@@ -249,6 +267,7 @@ export function registerReadingView(plugin: Plugin, getSettings: () => ImageSett
 			alive = false;
 			observer.disconnect();
 			for (const [target, names] of applied) target.classList.remove(...names);
+			restoreImageParagraphs(element);
 		});
 		refresh();
 	};

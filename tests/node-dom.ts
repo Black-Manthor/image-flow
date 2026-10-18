@@ -9,6 +9,13 @@ if (typeof scope.HTMLElement === 'undefined') scope.HTMLElement = class HTMLElem
 // No layout here: an observer of sizes that never reports (the browser suites
 // test it on a real DOM).
 if (typeof scope.ResizeObserver === 'undefined') scope.ResizeObserver = class ResizeObserver { observe() {} unobserve() {} disconnect() {} };
+// Nor frames: an animation frame asked for never comes (the browser suites run
+// them), so an observation started from the next frame never starts here.
+if (typeof scope.requestAnimationFrame === 'undefined') {
+	let frames = 0;
+	scope.requestAnimationFrame = () => ++frames;
+	scope.cancelAnimationFrame = () => {};
+}
 const define = (name: string, descriptor: PropertyDescriptor) =>
 	Object.defineProperty(Object.prototype, name, { configurable: true, enumerable: false, ...descriptor });
 // Assigning the name gives the object its own property (CodeMirror's

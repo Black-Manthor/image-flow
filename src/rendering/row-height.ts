@@ -14,6 +14,20 @@ export const rowHeightEffect = StateEffect.define<{ line: number; height: number
 	map: ({ line, height }, mapping) => ({ line: mapping.mapPos(line), height }),
 });
 
+// A row's height as laid out, not rounded: a row drawn again starts at it
+// (`iw-row-pending`), and a rounded value (255 for 255.1) made everything below
+// move by the difference a frame after the row was drawn.
+export function rowHeightOf(root: HTMLElement): number {
+	return root.getBoundingClientRect().height;
+}
+
+// Two heights of the same layout. Chromium lays out in 1/64 px, so a real
+// change is at least that much; half of it keeps a float's noise from counting
+// as a change (and redrawing the row for nothing).
+export function sameRowHeight(a: number, b: number): boolean {
+	return Math.abs(a - b) < 1 / 128;
+}
+
 // The last height reported for the row on the line starting at `line`: a row
 // drawn again starts at it, so CodeMirror never measures the empty widget.
 export function knownRowHeight(state: EditorState, line: number): number | undefined {

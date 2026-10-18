@@ -10,7 +10,7 @@ import { startBlockDrag } from './block-drag';
 import { createBlockToolbar } from './block-toolbar';
 import { previewStart } from './preview-dom';
 import { applyRow } from './row-layout';
-import { rowHeightEffect } from './row-height';
+import { rowHeightEffect, rowHeightOf } from './row-height';
 import { notify, notifyError } from '../ui/notify';
 import { t } from '../i18n';
 
@@ -67,7 +67,7 @@ function apply(view: EditorView, root: HTMLElement, position: number, patch: Par
 		const next = rowAtPosition(source.slice(0, edit.from) + edit.text + source.slice(edit.to), position, defaults);
 		const paragraph = root.querySelector<HTMLElement>('p.iw-row');
 		const laidOut = next && paragraph && root.isConnected && applyRow(paragraph, next);
-		const effects = laidOut ? [rowHeightEffect.of({ line: next.from, height: Math.round(root.getBoundingClientRect().height) })] : [];
+		const effects = laidOut ? [rowHeightEffect.of({ line: next.from, height: rowHeightOf(root) })] : [];
 		// Its own undo step, even right after another choice.
 		view.dispatch({ changes: { from: edit.from, to: edit.to, insert: edit.text }, effects, userEvent: 'input.iw-row',
 			annotations: isolateHistory.of('full') });

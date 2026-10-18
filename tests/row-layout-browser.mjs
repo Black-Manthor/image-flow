@@ -5,26 +5,45 @@ import { after, before, test } from 'node:test';
 import { readFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import { chromium } from '@playwright/test';
-import { coverageDir, savePageCoverage, startPageCoverage } from './copertura-mappa.mjs';
-import { record } from './registro.mjs';
+import { join } from 'node:path';
+import { inlineMap, savePageCoverage, startPageCoverage } from './copertura-mappa.mjs';
+import { record, sourceMapper } from './registro.mjs';
+import { failureScreenshot, runWithEvidence, watchPage } from './pagina-segnalazioni.mjs';
 
 const bundle = await build({ entryPoints: ['tests/fixtures/row-layout.ts'], bundle: true, write: false,
-	format: 'iife', globalName: 'rows', ...(coverageDir ? { sourcemap: 'inline' } : {}) });
-let browser, page;
+	// A map back to the sources: the errors in the registry, and the coverage.
+	format: 'iife', globalName: 'rows', sourcemap: 'inline' });
+// Named, so that the page's stack traces say which script: mapped to src/ and tests/.
+const code = bundle.outputFiles[0].text.replace('//# sourceMappingURL=', '//# sourceURL=iw-righe.js\n//# sourceMappingURL=');
+const bundles = [{ url: 'iw-righe.js', map: sourceMapper(inlineMap(code), process.cwd()) }];
+// A failed test's page, kept (never overwritten) and named in the registry.
+const failures = join('.obsidian-test', 'screenshots', 'chromium-righe', 'fallimenti');
+let browser, page, watch;
 
 before(async () => {
 	browser = await chromium.launch({ headless: true });
 	record({ kind: 'environment', chromium: browser.version(), build: 'fixture' });
 	page = await browser.newPage({ viewport: { width: 1600, height: 1200 } });
+	// Listened before the code under test runs (tests/pagina-segnalazioni.mjs);
+	// an error reported by the page fails the test it happened in.
+	watch = await watchPage(page, { label: 'righe', bundles });
+	watch.test = 'caricamento della pagina';
 	await startPageCoverage(page);
 	await page.addStyleTag({ content: await readFile('styles.css', 'utf8') });
-	await page.addScriptTag({ content: bundle.outputFiles[0].text });
+	await page.addScriptTag({ content: code });
+	if (watch.errors.length) {
+		await failureScreenshot(page, watch.test, failures);
+		throw new Error(`the page did not load: ${watch.errors.map(entry => `${entry.event ?? 'console'}: ${entry.text}`).join('; ')}`);
+	}
 });
 
 after(async () => {
-	if (page) await savePageCoverage(page, 'righe', bundle.outputFiles[0].text, process.cwd(), entry => entry.source === bundle.outputFiles[0].text);
+	if (page) await savePageCoverage(page, 'righe', code, process.cwd(), entry => entry.source === code);
+	await watch?.stop();
 	await browser?.close();
 });
+
+const rowTest = (name, body) => test(name, () => runWithEvidence({ page, watch, name, body, failures }));
 
 const measure = async (width, line, naturals, media = 'screen', floatBefore = 0) => {
 	await page.emulateMedia({ media });
@@ -61,7 +80,7 @@ const measure = async (width, line, naturals, media = 'screen', floatBefore = 0)
 const near = (actual, expected, label) => assert.ok(Math.abs(actual - expected) < 1, `${label}: ${actual} ≠ ${expected}`);
 const square = [[100, 100], [100, 100], [100, 100]];
 
-test('righe: composizione base e responsive', async () => {
+rowTest('righe: composizione base e responsive', async () => {
 	let r = await measure(1000, '![[a.png|200]] ![[b.png|300]]', square);
 	assert.equal(r.applied, true);
 	near(r.band[1], 700, 'band'); near(r.images[0][1], 200, 'w1'); near(r.images[1][1], 300, 'w2');
@@ -78,7 +97,7 @@ test('righe: composizione base e responsive', async () => {
 	near(r.images[0][1], 560 / 12, 'large gap image'); near(r.images[1][0] - r.images[0][1], 560 * 1000 / 1200, 'large gap scaled');
 });
 
-test('righe: allineamento e distribuzione orizzontale', async () => {
+rowTest('righe: allineamento e distribuzione orizzontale', async () => {
 	let r = await measure(1400, '![[a.png|200]] ![[b.png|300]] %%iw-row align=center%%', square);
 	near(r.band[0], 350, 'band centered'); near(r.images[0][0], 350 + (700 - 512) / 2, 'images centered');
 	r = await measure(1000, '![[a.png|200]] ![[b.png|300]] %%iw-row align=right%%', square);
@@ -91,7 +110,7 @@ test('righe: allineamento e distribuzione orizzontale', async () => {
 	}
 });
 
-test('righe: allineamento verticale e dimensioni naturali', async () => {
+rowTest('righe: allineamento verticale e dimensioni naturali', async () => {
 	let r = await measure(700, '![[a.png|100]] ![[b.png|100]] %%iw-row valign=bottom%%', [[100, 200], [100, 100]]);
 	near(r.images[0][2], r.images[1][2], 'bottom aligned');
 	r = await measure(700, '![[a.png|100]] ![[b.png|100]]', [[100, 200], [100, 100]]);
@@ -103,14 +122,14 @@ test('righe: allineamento verticale e dimensioni naturali', async () => {
 	near(r.images[0][1] / r.images[1][1], 1536 / 100, 'natural ratio');
 });
 
-test('righe: contesto esterno e stampa', async () => {
+rowTest('righe: contesto esterno e stampa', async () => {
 	let r = await measure(700, '![[a.png|300]] ![[b.png|300]]', square, 'screen', 400);
 	near(r.top, 400, 'below float'); near(r.band[1], 700, 'full band after float');
 	r = await measure(560, '![[a.png|200]] ![[b.png|300]]', square, 'print');
 	near(r.images[0][1], 160, 'print w1'); near(r.images[1][1], 240, 'print w2');
 });
 
-test('righe: caricamento tardivo e cleanup', async () => {
+rowTest('righe: caricamento tardivo e cleanup', async () => {
 	try {
 		const late = await page.evaluate(async () => {
 			document.body.replaceChildren();

@@ -51,9 +51,7 @@ export class MarkdownRenderer {
 		const lines = markdown.split('\n');
 		for (let line = 0; line < lines.length; line++) {
 			if (!lines[line]) continue;
-			const section = root.appendChild(root.ownerDocument.createElement('div'));
-			section.className = 'el-p';
-			const paragraph = section.appendChild(root.ownerDocument.createElement('p'));
+			const paragraph = root.appendChild(root.ownerDocument.createElement('p'));
 			const image = /^!\[\[([^|\]]+)\|([^|\]]+)\|(\d+)\]\]$/.exec(lines[line]!);
 			if (image) {
 				const embed = paragraph.appendChild(root.ownerDocument.createElement('span'));
@@ -75,7 +73,7 @@ export class MarkdownRenderer {
 					if (runtime.imagesLoad) img.src = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"/>');
 				}
 			} else paragraph.textContent = lines[line]!;
-			annotatePreviewSection(section, { getSectionInfo: () => ({ text: markdown, lineStart: line, lineEnd: line }) } as never);
+			annotatePreviewSection(paragraph, { getSectionInfo: () => ({ text: markdown, lineStart: line, lineEnd: line }) } as never);
 		}
 		if (runtime.settle) await new Promise(resolve => root.ownerDocument.defaultView!.requestAnimationFrame(resolve));
 		if (runtime.replace) for (const paragraph of Array.from(root.querySelectorAll('p'))) paragraph.replaceWith(paragraph.cloneNode(true));

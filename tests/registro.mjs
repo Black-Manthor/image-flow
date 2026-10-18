@@ -12,8 +12,8 @@
 // lines, without `content`, are compared by `state`). Every later line
 // carries the run's id; a run ends with an `end` line (or a `check`, a
 // `command`, a `coverage`): without one it was interrupted. Kinds: run,
-// environment, end, result, console, screenshot, coverage, check, command,
-// manual-check.
+// environment, end, result, container, collection, diagnostic, console,
+// screenshot, coverage, check, command, manual-check.
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -114,12 +114,14 @@ export const fileHash = path => { try { return createHash('sha256').update(readF
 
 const suiteOf = file => process.env.IW_SUITE ?? ({ 'obsidian.mjs': 'app', 'browser.mjs': 'chromium', 'row-layout-browser.mjs': 'chromium-righe' })[basename(file ?? '')] ?? basename(file ?? 'sconosciuta');
 
-function write(entry) {
+function write(entry, destination = registryFile()) {
 	mkdirSync(registry, { recursive: true });
-	appendFileSync(registryFile(), JSON.stringify({ time: new Date().toISOString(), ...entry }) + '\n');
+	appendFileSync(destination, JSON.stringify({ time: new Date().toISOString(), ...entry }) + '\n');
 }
 
 let current;
+let ended = false;
+export const runHasEnded = () => ended;
 // This process's run, started (and described in the registry) at its first use.
 export function currentRun(suite = suiteOf(process.argv[1])) {
 	if (current) return current;
@@ -132,9 +134,10 @@ export function currentRun(suite = suiteOf(process.argv[1])) {
 	return current;
 }
 
-export function record(entry) {
+export function record(entry, destination) {
 	const { run, suite } = currentRun();
-	write({ run, suite, ...entry });
+	write({ run, suite, ...entry }, destination);
+	if (entry.kind === 'end') ended = true;
 }
 
 // --- Where an error comes from ---------------------------------------------

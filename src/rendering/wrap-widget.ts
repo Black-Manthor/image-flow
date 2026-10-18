@@ -157,14 +157,21 @@ export class WrapWidget extends WidgetType {
 			refresh();
 			return true;
 		});
-		void MarkdownRenderer.render(this.plugin.app, this.snapshot.markdown, content, this.sourcePath, component)
-			.then(() => { drawn = true; refresh(); }).catch(() => {
-				if (!alive) return;
-				content.textContent = this.snapshot.markdown;
-				content.classList.add('iw-preview-fallback');
-				root.setAttribute('aria-label', t().previewUnavailable);
-				measure();
-			});
+		const rendering = MarkdownRenderer.render(this.plugin.app, this.snapshot.markdown, content, this.sourcePath, component);
+		// The renderer fills `content` before its promise settles: lay it out
+		// now, before the widget is attached. Obsidian can read the editor's
+		// geometry in the same task, before the observer above runs, and
+		// CodeMirror would keep the image's paragraph as the widget's height (a
+		// heading after a P is 24 px lower than after the carrier), then the
+		// clicked line and the line numbers move when the carrier comes.
+		refresh();
+		void rendering.then(() => { drawn = true; refresh(); }).catch(() => {
+			if (!alive) return;
+			content.textContent = this.snapshot.markdown;
+			content.classList.add('iw-preview-fallback');
+			root.setAttribute('aria-label', t().previewUnavailable);
+			measure();
+		});
 		return root;
 	}
 	// Events in the bar and on the resize handle belong to them: they must not

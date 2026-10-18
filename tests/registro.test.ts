@@ -129,6 +129,36 @@ test('console attribution uses structural evidence and never warning text', () =
 	assert.equal(consoleSource({ where: 'app://obsidian.md/plugins/image-rows-and-wraps/main.js', pluginId: 'image-rows-and-wraps' }), 'plugin');
 });
 
+test('a place of the page with no line, an error object or a message line prove no source: uncertain', () => {
+	// What the windows' `error` event gives for a ResizeObserver loop (Windows and
+	// Linux): the page, line and column 0, no error object, no stack.
+	const loop = { event: 'window-error', where: 'app://obsidian.md/index.html:0:0', stack: '', hasError: false };
+	assert.equal(consoleSource(loop), 'uncertain', 'the main window');
+	assert.equal(consoleSource({ ...loop, where: 'about:blank:0:0' }), 'uncertain', 'a separate window');
+	assert.equal(consoleSource({ ...loop, where: 'app://obsidian.md/index.html' }), 'uncertain', 'the page with no line');
+	assert.equal(consoleSource({ ...loop, where: ':0:0' }), 'uncertain', 'no address');
+	// An error object whose stack has no frame: its presence says nothing more.
+	assert.equal(consoleSource({ ...loop, stack: 'Error: boom', hasError: true }), 'uncertain');
+	assert.equal(consoleSource({ event: 'window-error', where: '', stack: '', hasError: true }), 'uncertain', 'a thrown value with no stack');
+	assert.equal(consoleSource({ ...loop, stack: 'Error: boom\n    at closing (<anonymous>)', hasError: true }), 'uncertain', 'a frame with no place');
+	// The message line is text, not a frame, even when it holds an address.
+	assert.equal(consoleSource({ event: 'unhandledrejection', where: '', stack: 'Error: not loaded app://obsidian.md/app.js:1:2' }), 'uncertain');
+	// Data missing or incomplete.
+	assert.equal(consoleSource({}), 'uncertain');
+	assert.equal(consoleSource({ where: undefined, stack: undefined, hasError: undefined }), 'uncertain');
+	assert.equal(consoleSource({ where: null, stack: null } as never), 'uncertain');
+
+	// The plugin wins wherever it is seen, the page's place notwithstanding.
+	assert.equal(consoleSource({ ...loop, stack: 'Error: boom\n    at f (plugin:image-rows-and-wraps:1:20)', hasError: true }), 'plugin');
+	assert.equal(consoleSource({ ...loop, frames: ['src/rendering/reading-view.ts:12:3'] }), 'plugin');
+	assert.equal(consoleSource({ ...loop, stack: 'Error: boom\n    at f (app://obsidian.md/x/iw.js:3:4)', bundleUrls: ['app://obsidian.md/x/iw.js'] }), 'plugin');
+	// A frame or a real place elsewhere is external.
+	assert.equal(consoleSource({ ...loop, stack: 'Error: boom\n    at f (app://obsidian.md/app.js:1:2)', hasError: true }), 'external', 'a frame of the app');
+	assert.equal(consoleSource({ ...loop, where: 'app://obsidian.md/app.js:12:3' }), 'external', 'a script and its line');
+	assert.equal(consoleSource({ ...loop, where: 'app://obsidian.md/index.html:12:5' }), 'external', 'a line of the page: a script in it');
+	assert.equal(consoleSource({ event: 'console', where: 'app://obsidian.md/app.js', stack: '\nat (app://obsidian.md/app.js:8:9)' }), 'external', 'a console message of the app');
+});
+
 test('console policy blocks errors and plugin warnings, while external and uncertain warnings remain reviewable', () => {
 	const error = { source: 'external', text: 'boom' };
 	const pluginWarning = { source: 'plugin', text: 'plugin warning' };
@@ -213,6 +243,22 @@ test('command records finish their own runs without becoming tests or external c
 	], { now: NOW, state: 'aaa' });
 	assert.deepEqual(report.runs.map((item: { status: string }) => item.status), ['superata', 'fallita', 'interrotta', 'interrotta']);
 	assert.equal(report.commands.length, 3);
+	assert.equal(report.runs.every((item: { results: unknown[]; checks: unknown[] }) => !item.results.length && !item.checks.length), true);
+});
+
+test('a command that exits 0 after printing a report passes with reports, never cleanly; a report does not hide a failure', () => {
+	const warned = run('css-warned', 1, [], { end: false }); warned[0]!.suite = 'comando:lint:css';
+	const clean = run('css-clean', 2, [], { end: false }); clean[0]!.suite = 'comando:lint:css';
+	const failed = run('css-failed', 3, [], { end: false }); failed[0]!.suite = 'comando:lint:css';
+	const interrupted = run('css-interrupted', 4, [], { end: false }); interrupted[0]!.suite = 'comando:lint:css';
+	const command = { kind: 'command', suite: 'comando:lint:css', command: 'lint:css', phase: 'lint css' };
+	const report = analyze([
+		...warned, { ...command, time: at(1), run: 'css-warned', ok: true, exitCode: 0, status: 'completed', reported: true },
+		...clean, { ...command, time: at(2), run: 'css-clean', ok: true, exitCode: 0, status: 'completed', reported: false },
+		...failed, { ...command, time: at(3), run: 'css-failed', ok: false, exitCode: 2, status: 'completed', reported: true },
+		...interrupted, { ...command, time: at(4), run: 'css-interrupted', ok: false, exitCode: null, signal: 'SIGINT', status: 'interrupted', interrupted: true, reported: true },
+	], { now: NOW, state: 'aaa' });
+	assert.deepEqual(report.runs.map((item: { status: string }) => item.status), ['superata con segnalazioni', 'superata', 'fallita', 'interrotta']);
 	assert.equal(report.runs.every((item: { results: unknown[]; checks: unknown[] }) => !item.results.length && !item.checks.length), true);
 });
 
@@ -461,6 +507,33 @@ const manualRun = (id: string, minute: number, check: Record<string, unknown>, s
 	{ time: at(minute), kind: 'manual-check', run: id, suite: 'manual', ...check },
 ];
 
+test('the summary shows an automatic check passed with warnings as such, and the first problem of a failed one', () => {
+	const dir = mkdtempSync(join(tmpdir(), 'iw-registro-controlli-'));
+	try {
+		const now = new Date();
+		const line = (run: string, minutes: number, entry: object) => JSON.stringify({ time: new Date(now.getTime() - minutes * 60000).toISOString(), run, suite: 'windows', ...entry });
+		const check = (run: string, minutes: number, fields: object) => [
+			line(run, minutes, { kind: 'run', commit: 'abc', state: 's', content: 'c'.repeat(40) }),
+			line(run, minutes, { kind: 'check', name: run, ok: true, results: { punto: true }, problems: [], console: [], ...fields }),
+		];
+		writeFileSync(join(dir, `${now.toISOString().slice(0, 10)}.jsonl`), [
+			...check('pulito', 4, { warnings: 0 }),
+			...check('con-avvisi', 3, { warnings: 2, channels: { raccolta: { errors: 0, warnings: 1 }, console: { errors: 0, warnings: 1 } } }),
+			// An older record: no count, warnings only in its console lines.
+			...check('vecchio-con-avviso', 2, { console: ['[warn] 10:00:00 [WARN] un avviso'] }),
+			...check('fallito', 1, { ok: false, problems: ['raccolta incompleta: raccolta scaduta prima della fine', 'altro'] }),
+		].join('\n') + '\n');
+		const shown = execFileSync(process.execPath, ['tests/registro-riepilogo.mjs'], { encoding: 'utf8', env: { ...process.env, IW_REGISTRO: dir } });
+		const section = shown.slice(shown.indexOf('Controlli automatici Windows'));
+		assert.match(section, /✔ .* pulito {2}\[[^\]]*\]\n/);
+		assert.match(section, /⚠ .* con-avvisi {2}\[[^\]]*\] {2}superato con 2 avvisi da revisionare/);
+		assert.match(section, /⚠ .* vecchio-con-avviso {2}\[[^\]]*\] {2}superato con 1 avvisi da revisionare/);
+		assert.match(section, /✖ .* fallito .*\n {4}problema: raccolta incompleta: raccolta scaduta prima della fine \(e altri 1\)/);
+		const history = execFileSync(process.execPath, ['tests/registro-riepilogo.mjs', '--storia'], { encoding: 'utf8', env: { ...process.env, IW_REGISTRO: dir } });
+		assert.match(history, / {4}raccolta: 0 errori, 1 avvisi\n {4}console: 0 errori, 1 avvisi/);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('manual checks finish their run while remaining separate from tests, commands and automatic checks', () => {
 	const report = analyze(manualRun('manual', 1, { type: 'targeted', scenarios: ['resize'], status: 'passed' }), { now: NOW, state: 'aaa' });
 	const [manual] = report.runs;
@@ -582,6 +655,7 @@ test('an uncaught exception without stack or location just after a secondary win
 	assert.equal(consoleSource(notTeardown['C: with a stack frame']), 'uncertain');
 	assert.equal(consoleSource(notTeardown['F: a console message, not an uncaught exception']), 'uncertain');
 	assert.equal(consoleSource(notTeardown['D: with a location']), 'external', 'external by its location, as before: still blocking');
+	assert.equal(consoleSource(notTeardown['D: with a location in the stack']), 'uncertain', 'an address in the message line is no frame: still blocking');
 	// E: a plugin frame wins over the teardown rule.
 	assert.equal(consoleSource({ ...observed, frames: ['src/rendering/row-widget.ts:89'] }), 'plugin');
 

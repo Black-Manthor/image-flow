@@ -1,9 +1,10 @@
 // End-to-end checks in the real Obsidian app: see tests/obsidian-app.mjs for the setup.
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFile, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { launchObsidian, openNote, prepareVault, record, registryFile, root, saveAppCoverage, vault } from './obsidian-app.mjs';
+import { detachWorkspaceWindow } from './obsidian-window.mjs';
 import { consoleOutcome } from './console-policy.mjs';
 import { longNote } from './long-note.mjs';
 
@@ -21,11 +22,62 @@ const LONTANO_WRAP = '[wrap:start] %%iw-wrap side=left%%\n\n![[c.png|200]]\n\nTe
 const LONTANO = `Prima.\n\n${LONTANO_RIGA}\n\n${LONTANO_WRAP}\n\n`
 	+ Array.from({ length: 400 }, (_, index) => `Paragrafo lontano ${index + 1}. ${'Testo di riempimento. '.repeat(12)}`).join('\n\n') + '\n';
 const RIGHE = 'Testo prima.\n\n![[a.png|200]] ![[b.png|300]] ![[c.png|200]]\n\n![[a.png|250]] %%iw-row align=center%%\n\nTesto dopo.\n';
+const filler = n => Array.from({ length: n }, (_, i) => `Riempimento ${i + 1}. ${'Testo di prova per la nota. '.repeat(6)}`).join('\n\n');
+const compactText = (phrase, count) => (phrase + ' ').repeat(count).trim();
+const COMPATTO = [
+	'Testo prima.',
+	'[wrap:start] %%iw-wrap side=left%%\n![[b.png|200]]\n' + compactText('Testo accanto all’immagine nel wrap compatto.', 10),
+	'## Titolo nel wrap compatto',
+	'- voce uno\n- voce due',
+	compactText('Ultimo paragrafo del wrap compatto.', 10) + '\n[wrap:end]',
+	'Testo dopo il wrap compatto.',
+	'[wrap:start] %%iw-wrap side=right%%\n![[a.png|180]]\n\n' + compactText('Secondo wrap compatto, immagine sola nel suo paragrafo.', 8),
+	compactText('Altro paragrafo.', 8) + '\n[wrap:end]',
+	'Fine.',
+].join('\n\n') + '\n';
+// A note of 14 short wraps, embedded below an HTML spacer that moves it by
+// 0.75 pt per px (a negative one through its collapsing margin). On Letter
+// with the default margin, the image of its "right-heading" wrap meets the
+// bottom of page 1 within CONFINE_RANGE.
+const CONFINE_CASI = (() => {
+	const blocks = [];
+	for (const side of ['left', 'right']) for (const kind of ['heading', 'paragraph', 'heading-only', 'later-heading']) {
+		const id = `${side}-${kind}`;
+		blocks.push(`PRIMA ${id}.`, `[wrap:start] %%iw-wrap side=${side}%%`, '![[c.png|160]]');
+		if (kind === 'paragraph' || kind === 'later-heading') blocks.push(`Paragrafo ${id}. Testo normale accanto all’immagine.`);
+		if (kind !== 'paragraph') blocks.push(`## Titolo ${id}`);
+		if (kind !== 'heading-only') blocks.push(`Corpo ${id}. Testo breve per verificare il confine del wrap.`);
+		blocks.push('[wrap:end]', `DOPO ${id}.`);
+	}
+	for (let level = 1; level <= 6; level++) blocks.push(`PRIMA livello-${level}.`, '[wrap:start] %%iw-wrap side=left%%', '![[c.png|160]]', `${'#'.repeat(level)} Titolo livello-${level}`, `Corpo livello-${level}.`, '[wrap:end]', `DOPO livello-${level}.`);
+	return blocks.join('\n\n') + '\n';
+})();
+// The spacer offsets (px) between which that image stops fitting on page 1,
+// and the step the search narrows them to. Without the fix, the embedded note
+// is sent to page 2 from the first offset where the image no longer fits for
+// about 4 px (measured on 1.13.4 and 1.14.4): a step of 0.5 px always puts an
+// export inside that window.
+const CONFINE_RANGE = [-8, 0], CONFINE_STEP = 0.5;
+const confineSpacer = offset => `<div style="${offset >= 0 ? `height: ${offset}px` : `height: 0; margin-block-end: ${offset}px`}"></div>`;
 let obsidian;
 
 before(async () => {
 	await prepareVault({
 		'Righe.md': RIGHE,
+  'GutterUscita.md': ['Prima.', '[wrap:start] %%iw-wrap side=left%%', '![[gutter-tall.png|167]]', '## Titolo dopo l’immagine', 'Testo nel wrap separato. '.repeat(12).trim(), '[wrap:end]', '![[a.png|180]] ![[gutter-tall.png|180]]', 'Fine.'].join('\n\n'),
+
+  'TitoliCarrier.md': ['Prima.', '[wrap:start] %%iw-wrap side=left%%', '![[a.png|180]]', '## Titolo due', 'Testo accanto. '.repeat(30), '[wrap:end]', '[wrap:start] %%iw-wrap side=right%%', '![[b.png|180]]', '### Titolo tre', 'Altro testo. '.repeat(30), '[wrap:end]', 'Fine.'].join('\n\n'),
+		'Compatto.md': COMPATTO,
+		'IncorporaWrap.md': '[[Wrap]]\n\n![[Wrap]]\n\nDopo.\n',
+		'ConfineCasi.md': CONFINE_CASI,
+		'IncorporaCompatto.md': '[[Compatto]]\n\n![[Compatto]]\n\nDopo.\n',
+		...Object.fromEntries(['LetturaSequenze', 'LetturaDistribuzione', 'LetturaNascosta', 'LetturaPopout', 'LetturaPopoutEditor'].map(name => [`${name}.md`, 'Prima.\n\n![[a.png|160]] ![[b.png|160]] %%iw-row gap=24%%\n\nDopo.\n'])),
+		'LetturaEstranea.md': 'Nota estranea.\n\n![[a.png|120]] ![[b.png|120]] %%iw-row align=right gap=24%%\n\nFine.\n',
+		'LetturaDiversa.md': 'Prima.\n\n![[a.png|160]] ![[b.png|160]] %%iw-row gap=24%%\n\nDopo.\n',
+		'LetturaLunga.md': 'Prima.\n\n![[a.png|160]] ![[b.png|160]] %%iw-row gap=24%%\n\n' + filler(400) + '\nFine.\n',
+		'LetturaAffiancata.md': 'Prima.\n\n![[a.png|160]] ![[b.png|160]] %%iw-row gap=24%%\n\nDopo.\n',
+		'LetturaGiaVistaRiga.md': 'Prima.\n\n![[a.png|160]] ![[b.png|160]] %%iw-row gap=8%%\n\nDopo.\n',
+		'LetturaGiaVistaWrap.md': `Prima.\n\n[wrap:start] %%iw-wrap side=left%%\n\n![[b.png|200]]\n\n${wrapText}\n\n[wrap:end]\n\nDopo.\n`,
 		// Tests that edit a note get a copy of their own: an editor change may still
 		// be unsaved when the next test opens another note.
 		...Object.fromEntries(['Commento', 'Palette', 'Altezza', 'Maniglia', 'SceltaA', 'SceltaB', 'Annulla', 'Distanza'].map(name => [`${name}.md`, RIGHE])),
@@ -41,10 +93,32 @@ before(async () => {
 		'Sistema.md': 'Prima.\n[wrap:start]\n![[a.png|200]]\nTesto accanto.\n[wrap:end]\nDopo.\n',
 		'Blocchi.md': BLOCCHI,
 		'Lontano.md': LONTANO,
+		// A row whose second image is upright (taller than the first) and a wrap
+		// with a short text (room to click beside it), between long text.
+		// Wraps with a heading after the image (a native rule spaces a heading
+		// after a P), one without, and a row of images: each far from the
+		// note's ends, so that an exit below can keep the clicked line.
+		'UscitaTitoli.md': [filler(25),
+			'Sopra wrap H2.', '[wrap:start] %%iw-wrap side=left%%', '![[gutter-tall.png|167]]', '## Titolo due', 'Testo accanto. '.repeat(20).trim(), '[wrap:end]', 'Sotto wrap H2.', filler(8),
+			'Sopra wrap H3.', '[wrap:start] %%iw-wrap side=right%%', '![[gutter-tall.png|167]]', '### Titolo tre', 'Altro testo. '.repeat(20).trim(), '[wrap:end]', 'Sotto wrap H3.', filler(8),
+			'Sopra wrap semplice.', '[wrap:start] %%iw-wrap side=left%%', '![[gutter-tall.png|167]]', 'Paragrafo accanto. '.repeat(20).trim(), '[wrap:end]', 'Sotto wrap semplice.', filler(8),
+			'Sopra riga.', '![[a.png|180]] ![[gutter-tall.png|180]]', 'Sotto riga.', filler(25)].join('\n\n') + '\n',
+		'Ingresso.md': [filler(20), 'Sopra la riga.', '![[a.png|200]] ![[b.png|200]]', 'Sotto la riga.', filler(4), 'Sopra il wrap.',
+			'[wrap:start] %%iw-wrap side=left%%', '![[c.png|260]]', 'Testo breve accanto all’immagine.', '[wrap:end]', 'Sotto il wrap.', filler(20)].join('\n\n') + '\n',
 		'Spazi.md': `Primo paragrafo.\n\n![[a.png|200]] ![[b.png|300]] ![[c.png|200]]\n\nSecondo paragrafo.\n\n[wrap:start] %%iw-wrap side=left%%\n\n![[b.png|200]]\n\n${wrapText}\n\n[wrap:end]\n\nTerzo paragrafo.\n`,
-	}, [['a.png', 400, 300, '#c44'], ['b.png', 300, 400, '#4a4'], ['c.png', 500, 250, '#44c']]);
+	}, [['gutter-tall.png', 300, 600, '#739'], ['a.png', 400, 300, '#c44'], ['b.png', 300, 400, '#4a4'], ['c.png', 500, 250, '#44c']]);
 	await mkdir(join(shots, 'fine-test'), { recursive: true });
-	obsidian = await launchObsidian();
+	if (process.env.IW_OBSIDIAN_THEME_DIR) {
+  const theme = JSON.parse(await readFile(join(process.env.IW_OBSIDIAN_THEME_DIR, 'manifest.json'), 'utf8'));
+  await cp(process.env.IW_OBSIDIAN_THEME_DIR, join(vault, '.obsidian', 'themes', theme.name), { recursive: true });
+  await writeFile(join(vault, '.obsidian', 'appearance.json'), JSON.stringify({ cssTheme: theme.name }));
+ }
+ obsidian = await launchObsidian();
+ if (process.env.IW_OBSIDIAN_THEME_DIR) {
+  const theme = await obsidian.page.evaluate(() => window.app.customCss.theme);
+  record({ kind: 'environment', theme });
+  assert.ok(theme, 'community theme loaded');
+ }
 });
 
 // The registry tags what the app writes with the test in progress.
@@ -80,11 +154,11 @@ async function resetApp(test) {
 	for (const other of page.context().pages()) {
 		if (other === page || other.isClosed()) continue;
 		left.push(`una finestra (${other.url().slice(0, 60)})`);
-		await other.close().catch(() => {});
+		await detachWorkspaceWindow(other);
 	}
 	const extra = await page.evaluate(() => {
 		const leaves = [];
-		window.app.workspace.iterateRootLeaves(leaf => leaves.push(leaf));
+		window.app.workspace.iterateRootLeaves(leaf => { leaves.push(leaf); });
 		for (const leaf of leaves.slice(1)) leaf.detach();
 		return { tabs: Math.max(0, leaves.length - 1), dialogs: document.querySelectorAll('.modal-container').length };
 	}).catch(() => ({ tabs: 0, dialogs: 0 }));
@@ -211,6 +285,245 @@ test('Lettura: una riga il cui solo commento è cambiato viene reimpaginata', as
 	const [, row] = await boxes('.iw-row', scope);
 	const [, , , image] = await boxes('.iw-row .image-embed', scope);
 	assert.ok(Math.abs(image.right - row.right) < 2, 'immagine al bordo destro della riga');
+});
+
+async function pairedReadingScenario(path, topology, steps, typing = false) {
+	const { page } = obsidian;
+	await openNote(page, path, 'live');
+	await page.evaluate(() => window.app.workspace.activeEditor.editor.setCursor(0, 0));
+	await laidOut(container('live'), '.iw-row-preview', 1);
+	let popout;
+	const opening = topology.includes('popout') ? page.context().waitForEvent('page') : null;
+	try {
+		await page.evaluate(async topology => {
+			const app = window.app;
+			let live = app.workspace.activeLeaf;
+			let reading;
+			if (topology === 'popout-live') {
+				reading = live;
+				await reading.view.setState({ mode: 'preview' }, {});
+				live = app.workspace.openPopoutLeaf();
+				await live.openFile(reading.view.file, { state: { mode: 'source', source: false } });
+				live.view.editor.setCursor(live.view.editor.lastLine(), 0);
+			} else reading = topology === 'popout-reading' ? app.workspace.openPopoutLeaf() : app.workspace.getLeaf(topology === 'hidden' ? 'tab' : 'split', 'vertical');
+			await reading.openFile(live.view.file, { state: { mode: 'preview' } });
+			window.pairedReading = { live, reading, hidden: topology === 'hidden' };
+			app.workspace.setActiveLeaf(live, { focus: true });
+		}, topology);
+		if (opening) { popout = await opening; await popout.waitForLoadState(); }
+		if (typing === 'other') await page.evaluate(async () => {
+			const pair = window.pairedReading, app = window.app;
+			pair.other = app.workspace.getLeaf('split', 'vertical');
+			await pair.other.openFile(app.vault.getFileByPath('LetturaEstranea.md'), { state: { mode: 'source', source: false } });
+			pair.other.view.editor.setCursor(pair.other.view.editor.lastLine(), 0);
+			app.workspace.setActiveLeaf(pair.live, { focus: true });
+		});
+		const inputPage = topology === 'popout-live' ? popout : page;
+		await inputPage.evaluate(() => window.dispatchEvent(new FocusEvent('focus')));
+		await page.waitForFunction(() => {
+			const { live, reading, hidden } = window.pairedReading;
+			return [live, reading].every(leaf => {
+				if (hidden && leaf === reading) return reading.view.containerEl.getBoundingClientRect().width === 0;
+				const row = leaf.view.containerEl.querySelector(leaf === reading ? '.markdown-preview-view p.iw-row' : '.iw-row-preview p.iw-row');
+				return row && (hidden && leaf === reading || row.getBoundingClientRect().width > 0) && [...row.querySelectorAll('img')].every(img => img.complete && img.naturalWidth);
+			});
+		});
+		// No remaining layout or save retry may make the uncorrected code pass.
+		for (const [kind, index, align, valign] of steps) {
+			await inputPage.evaluate(() => window.dispatchEvent(new FocusEvent('focus')));
+			await page.waitForTimeout(2800);
+			await page.evaluate(({ kind, align, valign, typing }) => {
+				const app = window.app, pair = window.pairedReading;
+				pair.saved = null;
+				pair.saveCalled = null;
+				const modify = app.vault.modify;
+				pair.originalModify = modify;
+				app.vault.modify = function (file, ...args) {
+					if (file.path === pair.live.view.file.path) pair.saveCalled = performance.now();
+					return modify.call(this, file, ...args);
+				};
+				pair.changed = null;
+				pair.receive = null;
+				pair.activation = null;
+				pair.expected = { align, valign };
+				pair.modifyRef = app.vault.on('modify', file => { if (file.path === pair.live.view.file.path) pair.saved = performance.now(); });
+				pair.editRef = app.workspace.on('editor-change', (_, info) => {
+					if (info.file?.path === pair.live.view.file.path && pair.changed === null) {
+						pair.changed = performance.now();
+						if (typing) {
+							let remaining = 40;
+							pair.typing = setInterval(() => {
+								const editor = (typing === 'other' ? pair.other : pair.live).view.editor, line = editor.lastLine();
+								editor.replaceRange('x', { line, ch: editor.getLine(line).length });
+								if (!--remaining) clearInterval(pair.typing);
+							}, 20);
+						}
+					}
+				});
+				const cm = pair.live.view.editor.cm;
+				pair.originalDispatch = cm.dispatch;
+				pair.originalDoc = cm.state.doc;
+				pair.firstDispatch = true;
+				cm.dispatch = function (...args) {
+					const start = performance.now();
+					const result = pair.originalDispatch.apply(this, args);
+					if (pair.firstDispatch && this.state.doc !== pair.originalDoc) {
+						pair.firstDispatch = false;
+						pair.changed = start;
+						pair.dispatchMs = performance.now() - start;
+					}
+					return result;
+				};
+				pair.measure = new Promise(resolve => {
+					const deadline = performance.now() + 5000;
+					const sample = () => {
+						if (pair.changed === null) {
+							if (performance.now() >= deadline) { resolve({ updated: false, reason: 'documento non modificato entro 5 s' }); return; }
+							pair.timer = setTimeout(sample, 5); return;
+						}
+						const now = performance.now(), row = pair.reading.view.containerEl.querySelector('.markdown-preview-view p.iw-row');
+						if (pair.receive === null && pair.reading.view.getViewData().includes(`${kind}=${kind === 'align' ? align : valign}`)) pair.receive = now - pair.changed;
+						const images = [...row?.querySelectorAll('img') ?? []].map(img => img.getBoundingClientRect());
+						const center = box => valign === 'bottom' ? box.bottom : valign === 'top' ? box.top : (box.top + box.bottom) / 2;
+						const rect = row?.getBoundingClientRect();
+						const horizontal = images.length === 2 && (align === 'right' ? Math.abs(images[1].right - rect.right) < 2 : align === 'center' ? Math.abs((images[0].left + images[1].right - rect.left - rect.right) / 2) < 2 : Math.abs(images[0].left - rect.left) < 2);
+						const geometry = horizontal && Math.abs(center(images[0]) - center(images[1])) < 2;
+						const updated = row?.classList.contains(`iw-row-valign-${valign}`) && row.classList.contains(`iw-row-align-${align}`) && geometry && rect.width > 0;
+						if (pair.hidden && pair.activation === null && now - pair.changed >= 200) { pair.activation = performance.now(); app.workspace.setActiveLeaf(pair.reading, { focus: true }); }
+						if (updated || now - pair.changed >= 750) resolve({ updated, ms: now - pair.changed, receive: pair.receive, dispatchMs: pair.dispatchMs, activation: pair.activation === null ? null : pair.activation - pair.changed, afterActivation: pair.activation === null ? null : now - pair.activation, savedBeforeLayout: pair.saveCalled !== null, modifyEventBeforeLayout: pair.saved !== null, classes: row?.className, images: images.map(({ top, bottom }) => ({ top, bottom })) });
+						else pair.timer = setTimeout(sample, 5);
+					};
+					sample();
+				});
+				pair.live.view.containerEl.querySelectorAll('.iw-row-toolbar button')[kind === 'align' ? 1 : 2].click();
+			}, { kind, align, valign, typing });
+			await inputPage.locator('.menu .menu-item').nth(index).click();
+			const result = await page.evaluate(() => window.pairedReading.measure);
+			console.log(`tempi Lettura affiancata (${topology}, ${kind}): ${JSON.stringify(result)}`);
+			assert.ok(result.updated && result.ms <= 750, `classi e geometria entro 750 ms: ${JSON.stringify(result)}`);
+			if (topology !== 'hidden') assert.equal(result.savedBeforeLayout, false, 'layout prima di vault.modify');
+			else assert.ok(result.afterActivation < 250, `layout dalla riattivazione: ${JSON.stringify(result)}`);
+			if (typing) await page.waitForTimeout(850);
+			await page.evaluate(() => {
+				const pair = window.pairedReading;
+				window.app.vault.offref(pair.modifyRef); window.app.workspace.offref(pair.editRef);
+				pair.modifyRef = pair.editRef = null;
+				window.app.vault.modify = pair.originalModify;
+				pair.originalModify = null;
+				pair.live.view.editor.cm.dispatch = pair.originalDispatch;
+				pair.originalDispatch = null;
+				window.app.workspace.setActiveLeaf(pair.live, { focus: true });
+			});
+		}
+	} finally {
+		await page.evaluate(topology => {
+			const pair = window.pairedReading;
+			if (!pair) return;
+			clearTimeout(pair.timer); clearInterval(pair.typing);
+			if (pair.originalDispatch) pair.live.view.editor.cm.dispatch = pair.originalDispatch;
+			if (pair.originalModify) window.app.vault.modify = pair.originalModify;
+			if (pair.modifyRef) window.app.vault.offref(pair.modifyRef);
+			if (pair.editRef) window.app.workspace.offref(pair.editRef);
+			pair.reading.detach();
+			if (pair.other) pair.other.detach();
+			if (topology === 'popout-live') pair.live.detach();
+			delete window.pairedReading;
+		}, topology);
+		if (popout) await popout.waitForEvent('close', { timeout: 5000 }).catch(error => { if (!popout.isClosed()) throw error; });
+	}
+}
+
+test('Lettura affiancata: il commento esistente aggiorna classi e geometria entro 750 ms prima del salvataggio', async () => {
+	await pairedReadingScenario('LetturaAffiancata.md', 'split', [['valign', 1, 'left', 'center']]);
+});
+
+test('Lettura affiancata: ordine inverso e modifiche ripetute', async () => {
+	await pairedReadingScenario('LetturaSequenze.md', 'split', [['valign', 1, 'left', 'center'], ['align', 1, 'center', 'center'], ['valign', 2, 'center', 'bottom'], ['align', 2, 'right', 'bottom']], false);
+});
+
+test('Lettura affiancata: distribuzione poi verticale', async () => {
+	await pairedReadingScenario('LetturaDistribuzione.md', 'split', [['align', 1, 'center', 'top'], ['valign', 1, 'center', 'center']], false);
+});
+
+test('Lettura affiancata: nota lunga e digitazione continua', async () => {
+	await pairedReadingScenario('LetturaLunga.md', 'split', [['valign', 1, 'left', 'center']], true);
+});
+
+test('Lettura affiancata: digitazione in una nota diversa non rinvia il layout', async () => {
+	await pairedReadingScenario('LetturaDiversa.md', 'split', [['valign', 1, 'left', 'center']], 'other');
+});
+
+test('Lettura affiancata: scheda nascosta: tempo distinto dalla riattivazione', async () => {
+	await pairedReadingScenario('LetturaNascosta.md', 'hidden', [['valign', 1, 'left', 'center']], false);
+});
+
+test('Lettura affiancata: Lettura nella finestra separata', async () => {
+	await pairedReadingScenario('LetturaPopout.md', 'popout-reading', [['align', 1, 'center', 'top'], ['valign', 1, 'center', 'center']], false);
+});
+
+test('Lettura affiancata: editor nella finestra separata', async () => {
+	await pairedReadingScenario('LetturaPopoutEditor.md', 'popout-live', [['valign', 1, 'left', 'center'], ['align', 1, 'center', 'center']], false);
+});
+
+// A Reading tab already shown, then left inactive; the note's comment is
+// changed from its Live Preview tab and, once the text has reached the Reading
+// view, the Reading tab is shown again. The section is processed anew from the
+// plugin's visibility observer: its new layout must be in the first frame that
+// shows it, and the browser must report no ResizeObserver loop. Frames
+// are read with animation callbacks, without an observer of the test's own.
+async function readingShownAgain(path, kind, from, to) {
+	const { page } = obsidian;
+	const before = obsidian.errors.length;
+	const result = await page.evaluate(async ({ path, kind, from, to }) => {
+		const app = window.app, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+		const file = app.vault.getFileByPath(path);
+		const live = app.workspace.getLeaf(false);
+		await live.openFile(file, { state: { mode: 'source', source: false } });
+		const reading = app.workspace.getLeaf('tab');
+		await reading.openFile(file, { state: { mode: 'preview' } });
+		app.workspace.setActiveLeaf(reading, { focus: true });
+		const read = () => {
+			const scope = reading.view.containerEl.querySelector('.markdown-preview-view');
+			const element = scope?.querySelector(kind === 'riga' ? 'p.iw-row' : '.iw-reading-wrap');
+			if (!element) return null;
+			const value = kind === 'riga' ? element.style.getPropertyValue('--iw-row-gap') : (element.className.match(/iw-layout-iw-\w+/) ?? [''])[0];
+			return { value, width: element.getBoundingClientRect().width };
+		};
+		for (let i = 0; i < 200 && !(read()?.width > 0); i++) await sleep(25);
+		const shown = read();
+		await sleep(300);
+		app.workspace.setActiveLeaf(live, { focus: true });
+		await sleep(500);
+		const editor = live.view.editor;
+		const index = editor.getValue().indexOf(from);
+		editor.replaceRange(to, editor.offsetToPos(index), editor.offsetToPos(index + from.length));
+		let arrived = false;
+		for (let i = 0; i < 400 && !(arrived = reading.view.getViewData().includes(to)); i++) await sleep(5);
+		await sleep(150);
+		app.workspace.setActiveLeaf(reading, { focus: true });
+		const samples = [];
+		for (let i = 0; i < 12; i++) { await frame(); samples.push(read()); }
+		const firstVisible = samples.findIndex(sample => sample?.width > 0);
+		const firstNew = samples.findIndex(sample => sample?.width > 0 && sample.value !== shown.value);
+		reading.detach();
+		app.workspace.setActiveLeaf(live, { focus: true });
+		return { shown, arrived, firstVisible, firstNew, samples: samples.slice(0, 4) };
+	}, { path, kind, from, to });
+	await page.waitForTimeout(300);
+	const loops = obsidian.errors.slice(before).filter(entry => /ResizeObserver loop/.test(entry.text));
+	console.log(`Lettura già vista (${kind}): ${JSON.stringify({ ...result, loops: loops.length })}`);
+	assert.ok(result.shown?.width > 0, `la Lettura mostrata prima del cambio: ${JSON.stringify(result)}`);
+	assert.equal(result.arrived, true, 'il testo nuovo arrivato alla Lettura prima del ritorno');
+	assert.ok(result.firstVisible >= 0 && result.firstNew === result.firstVisible, `nuova disposizione nel primo fotogramma visibile: ${JSON.stringify(result)}`);
+	assert.deepEqual(loops.map(entry => `${entry.event} ${entry.window}: ${entry.text}`), [], 'nessun ciclo di ResizeObserver al ritorno');
+}
+
+test('Lettura già vista in un’altra scheda: riga di immagini cambiata, nuova disposizione nel primo fotogramma, nessun ciclo di ResizeObserver', async () => {
+	await readingShownAgain('LetturaGiaVistaRiga.md', 'riga', 'gap=8', 'gap=24');
+});
+
+test('Lettura già vista in un’altra scheda: wrap cambiato di lato, nuova disposizione nel primo fotogramma, nessun ciclo di ResizeObserver', async () => {
+	await readingShownAgain('LetturaGiaVistaWrap.md', 'wrap', 'side=left', 'side=right');
 });
 
 test('Live Preview: cambiando la distanza predefinita ogni riga viene ridisegnata una volta sola', async () => {
@@ -420,9 +733,11 @@ const clickAndMeasureLongBlock = async (heading, skip, root, inner, beside = fal
 		}, { heading, skip, root, inner, beside });
 		await page.mouse.click(before.x, before.y);
 		await page.waitForTimeout(800);
+		// The top of the line, not the caret: on a row's line the caret sits below
+		// the images Obsidian shows there.
 		const after = await page.evaluate(start => {
 			const view = window.app.workspace.activeEditor.editor.cm;
-			return { head: view.state.selection.main.head, top: view.coordsAtPos(start)?.top };
+			return { head: view.state.selection.main.head, top: view.documentTop + view.lineBlockAt(start).top };
 		}, before.start);
 		return { before, after };
 	};
@@ -434,7 +749,7 @@ test('Live Preview: entrare e uscire da un wrap non sposta il punto cliccato', a
 	await placeLongBlock('## Sezione 12', 'Testo accanto', 350);
 	const wrap = await clickAndMeasureLongBlock('## Sezione 12', 'Testo accanto', '.cm-content .iw-preview:not(.iw-row-preview)', '.iw-first-paragraph');
 	assert.equal(wrap.after.head, wrap.before.start, 'il cursore all’inizio del paragrafo cliccato');
-	assert.ok(Math.abs(wrap.after.top - wrap.before.top) <= 3, `wrap: il paragrafo da ${wrap.before.top} a ${wrap.after.top}`);
+	assert.ok(Math.abs(wrap.after.top - wrap.before.top) <= 1, `wrap: il paragrafo da ${wrap.before.top} a ${wrap.after.top}`);
 	// Leaving it from below: the next heading, brought into view and clicked,
 	// sampled at every frame for a second.
 	await placeLongBlock('## Sezione 13', '## Sezione 13', 500);
@@ -475,7 +790,251 @@ test('Live Preview: aprire una riga di immagini non sposta il punto cliccato', a
 	await placeLongBlock('## Sezione 20', '![[a.png|200]]', 350);
 	const row = await clickAndMeasureLongBlock('## Sezione 20', '![[a.png|200]]', '.cm-content .iw-row-preview', null, true);
 	assert.equal(row.after.head, row.before.start, 'il cursore all’inizio della riga di immagini');
-	assert.ok(Math.abs(row.after.top - row.before.top) <= 3, `riga: da ${row.before.top} a ${row.after.top}`);
+	assert.ok(Math.abs(row.after.top - row.before.top) <= 1, `riga: da ${row.before.top} a ${row.after.top}`);
+});
+
+// Entering from an empty point of a block keeps the block, and everything
+// above it, where it was in every frame; three entries, each left with a click
+// above, leave the block where it started (previously each entry moved a row up by
+// the images Obsidian shows on its source line, a wrap by its marker lines).
+const emptyPointEntry = async kind => {
+	const { page } = obsidian;
+	return page.evaluate(kind => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		const text = view.state.doc.toString();
+		const reference = text.indexOf(kind === 'row' ? 'Sopra la riga.' : 'Sopra il wrap.');
+		const start = text.indexOf(kind === 'row' ? '![[a.png|200]] ![[b.png|200]]' : '[wrap:start]', reference);
+		const root = [...document.querySelectorAll('.workspace-leaf.mod-active .cm-content .iw-preview')].find(e => view.posAtDOM(e) === start);
+		const r = root.getBoundingClientRect();
+		const right = [...root.querySelectorAll('img')].map(e => e.getBoundingClientRect().right).reduce((a, b) => Math.max(a, b), r.left);
+		const candidates = kind === 'row'
+			? [0.5, 0.65, 0.8].map(f => ({ x: right + (r.right - right) * f, y: r.top + r.height / 2 }))
+			: [[30, 8], [60, 8], [30, 2], [60, 2]].map(([dx, dy]) => ({ x: r.right - dx, y: r.bottom - dy }));
+		const point = candidates.find(p => {
+			const e = document.elementFromPoint(p.x, p.y);
+			return e && root.contains(e) && !e.closest('img, .iw-row-handle, .iw-wrap-handle, .iw-block-toolbar') && !(e.tagName === 'P' && !e.classList.contains('iw-row'));
+		});
+		return { start, reference, top: r.top, point };
+	}, kind);
+};
+// The images on screen loaded (the note starts with text only).
+const imagesShown = () => obsidian.page.waitForFunction(selector => {
+	const images = [...document.querySelectorAll(`${selector} .image-embed`)];
+	return images.length > 0 && images.every(image => image.classList.contains('is-loaded'));
+}, container('live'), { timeout: 15000 }).then(() => obsidian.page.waitForTimeout(300));
+const framesDuring = async (positions, action) => {
+	const { page } = obsidian;
+	await page.evaluate(positions => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		window.iwFrames = [];
+		const t0 = performance.now();
+		const tick = () => {
+			window.iwFrames.push(positions.map(p => view.coordsAtPos(p)?.top ?? null));
+			if (performance.now() - t0 < 1000) requestAnimationFrame(tick);
+		};
+		requestAnimationFrame(tick);
+	}, positions);
+	await page.waitForTimeout(50);
+	await action();
+	await page.waitForTimeout(1100);
+	return page.evaluate(() => window.iwFrames);
+};
+
+for (const [kind, label, reference, skip] of [['row', 'una riga di immagini', 'Sopra la riga.', '![[a.png|200]]'], ['wrap', 'un wrap', 'Sopra il wrap.', '[wrap:start]']]) {
+	test(`Live Preview: entrando da un punto vuoto di ${label}, la nota resta ferma in ogni fotogramma`, async () => {
+		const { page } = obsidian;
+		await openNote(page, 'Ingresso.md', 'live');
+		await page.evaluate(() => window.app.workspace.activeEditor.editor.setCursor(0, 0));
+		await placeLongBlock(reference, skip, 350);
+		await imagesShown();
+		const block = await emptyPointEntry(kind);
+		assert.ok(block.point, 'un punto vuoto nel blocco');
+		const frames = await framesDuring([block.reference], () => page.mouse.click(block.point.x, block.point.y));
+		const tops = frames.map(f => Math.round(f[0]));
+		assert.ok(Math.max(...tops) - Math.min(...tops) <= 1, `il testo sopra si è mosso (${[...new Set(tops)].join(', ')})`);
+		const after = await page.evaluate(start => {
+			const view = window.app.workspace.activeEditor.editor.cm;
+			return { line: view.documentTop + view.lineBlockAt(start).top, head: view.state.selection.main.head };
+		}, block.start);
+		assert.ok(after.head >= block.start, 'il cursore nel blocco');
+		assert.ok(Math.abs(after.line - block.top) <= 1, `la prima riga del blocco da ${block.top} a ${after.line}`);
+	});
+}
+
+// A row drawn again starts at its last known height. Saved rounded (275 for
+// 274.67), the row took its real height a frame after being drawn and moved
+// everything below by the difference. Tolerance 0.02 px: Chromium lays
+// out in 1/64 px (0.016), so positions differ by at least that when anything
+// moves; the shift measured before the fix was 0.07 px in this app (0.1 px on
+// Windows), well above it.
+test('Live Preview: uscendo da sotto, la riga di immagini ridisegnata non si muove più e non si aggiorna di continuo', async () => {
+	const { page } = obsidian;
+	await openNote(page, 'Ingresso.md', 'live');
+	await page.evaluate(() => window.app.workspace.activeEditor.editor.setCursor(0, 0));
+	await placeLongBlock('Sopra la riga.', '![[a.png|200]]', 300);
+	await imagesShown();
+	const block = await emptyPointEntry('row');
+	const image = await page.evaluate(start => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		const root = [...document.querySelectorAll('.workspace-leaf.mod-active .cm-content .iw-row-preview')].find(e => view.posAtDOM(e) === start);
+		const r = root.querySelector('img').getBoundingClientRect();
+		return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+	}, block.start);
+	await page.mouse.click(image.x, image.y);
+	await page.waitForTimeout(800);
+	const below = await page.evaluate(() => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		const at = view.state.doc.toString().indexOf('Sotto la riga.');
+		const c = view.coordsAtPos(at);
+		return { at, x: c.left + 25, y: (c.top + c.bottom) / 2 };
+	});
+	// Every frame, unrounded: the clicked line below and the drawn row's height;
+	// every change of the row's saved height.
+	await page.evaluate(({ start, at }) => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		window.iwFrames = [];
+		window.iwHeightReports = [];
+		const t0 = performance.now();
+		window.iwReports = new MutationObserver(records => {
+			for (const record of records) if (record.attributeName === 'data-iw-row-height') window.iwHeightReports.push(performance.now() - t0);
+		});
+		window.iwReports.observe(view.contentDOM, { attributes: true, subtree: true, attributeFilter: ['data-iw-row-height'] });
+		const tick = () => {
+			const root = [...document.querySelectorAll('.workspace-leaf.mod-active .cm-content .iw-row-preview')].find(e => { try { return view.posAtDOM(e) === start; } catch { return false; } });
+			window.iwFrames.push({ t: performance.now() - t0, drawn: Boolean(root), id: root ? (root.dataset.iwProbe ??= String(Math.random())) : null,
+				height: root ? root.getBoundingClientRect().height : null, below: view.coordsAtPos(at)?.top ?? null });
+			if (performance.now() - t0 < 1200) requestAnimationFrame(tick);
+		};
+		requestAnimationFrame(tick);
+	}, { start: block.start, at: below.at });
+	await page.waitForTimeout(50);
+	await page.mouse.click(below.x, below.y);
+	await page.waitForTimeout(1300);
+	const { frames, reports } = await page.evaluate(() => { window.iwReports.disconnect(); return { frames: window.iwFrames, reports: window.iwHeightReports }; });
+	const drawn = frames.filter(f => f.drawn);
+	assert.ok(drawn.length > 20, `la riga ridisegnata (${drawn.length} fotogrammi)`);
+	const spread = values => Math.max(...values) - Math.min(...values);
+	assert.ok(spread(drawn.map(f => f.below)) <= 0.02, `la riga sotto si è mossa dopo il ridisegno: ${[...new Set(drawn.map(f => f.below.toFixed(2)))].join(' → ')}`);
+	assert.ok(spread(drawn.map(f => f.height)) <= 0.02, `la riga di immagini ha cambiato altezza: ${[...new Set(drawn.map(f => f.height.toFixed(2)))].join(' → ')}`);
+	assert.equal(new Set(drawn.map(f => f.id)).size, 1, 'la riga non viene ridisegnata di nuovo');
+	const t0 = drawn[0].t;
+	assert.ok(reports.filter(t => t > t0 + 200).length === 0, `aggiornamenti dell'altezza dopo il ridisegno: ${reports.map(t => Math.round(t)).join(', ')}`);
+});
+
+// Leaving from below, the clicked line and what is below it keep their screen
+// pixel. The browser scrolls by whole device pixels and draws each position
+// rounded to the nearest one: a height change of 11.6 px compensated by 12
+// brought them down a pixel, on Windows at every exit. Where the
+// rounding falls depends on the editor's sub-pixel place (78.484 px on that
+// Windows): the editor is moved by eighths of a pixel, and the app zoomed,
+// so that some exits cross a half pixel whatever the height change. Where a
+// line of text is whole device pixels (zoom 1 and 1.25: 24 and 30) the
+// clicked line keeps its pixel, and at zoom 1 also the wrap's image further
+// down, which shares its sub-pixel place. Zoomed to 1.1 (26.4 device pixels
+// a line) every line has its own fraction: there the scroll is the nearest
+// one, the clicked line moving by at most half a device pixel (keeping it
+// exactly moved the lines below more often). In the frames after the redraw
+// nothing moves (0.02 px, as above), the scroll changes once and the clicked
+// line moves by less than a device pixel (no extra drift: the scroll also
+// takes in the lines above that CodeMirror measures again, zoomed).
+test('Live Preview: uscendo da sotto, la riga cliccata e ciò che sta sotto restano sullo stesso pixel', async () => {
+	const { page } = obsidian;
+	await openNote(page, 'Ingresso.md', 'live');
+	const failures = [];
+	let exits = 0;
+	try {
+		for (const zoom of [1, 1.25, 1.1]) for (let eighth = 0; eighth < 8; eighth++) {
+			const shift = eighth / 8;
+			await page.evaluate(({ zoom, shift }) => {
+				require('electron').webFrame.setZoomFactor(zoom);
+				const style = document.getElementById('iw-test-fase') ?? document.head.createEl('style', { attr: { id: 'iw-test-fase' } });
+				style.textContent = `.workspace-leaf.mod-active .view-header { height: calc(var(--header-height) + ${shift}px) !important; }`;
+				window.app.workspace.activeEditor.editor.setCursor(0, 0);
+			}, { zoom, shift });
+			// High enough that, zoomed, the line below the row's source stays on screen.
+			await placeLongBlock('Sopra la riga.', '![[a.png|200]]', 150);
+			await imagesShown();
+			const block = await emptyPointEntry('row');
+			const image = await page.evaluate(start => {
+				const view = window.app.workspace.activeEditor.editor.cm;
+				const root = [...document.querySelectorAll('.workspace-leaf.mod-active .cm-content .iw-row-preview')].find(e => view.posAtDOM(e) === start);
+				const r = root.querySelector('img').getBoundingClientRect();
+				return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+			}, block.start);
+			await page.mouse.click(image.x, image.y);
+			await page.waitForTimeout(600);
+			// The clicked line, the first image below it and the scroll, every
+			// frame from before the click; the row's drawn height.
+			const below = await page.evaluate(start => {
+				const view = window.app.workspace.activeEditor.editor.cm;
+				const text = view.state.doc.toString();
+				const at = text.indexOf('Sotto la riga.');
+				const next = text.indexOf('[wrap:start]', at);
+				const c = view.coordsAtPos(at);
+				window.iwFrames = [];
+				const t0 = performance.now();
+				const tick = () => {
+					const root = [...document.querySelectorAll('.workspace-leaf.mod-active .cm-content .iw-preview')];
+					const row = root.find(e => { try { return view.posAtDOM(e) === start; } catch { return false; } });
+					const wrap = root.find(e => { try { return view.posAtDOM(e) === next; } catch { return false; } });
+					window.iwFrames.push({ drawn: Boolean(row), line: view.coordsAtPos(at)?.top ?? null, image: wrap?.querySelector('img')?.getBoundingClientRect().top ?? null,
+						scroll: view.scrollDOM.scrollTop, height: view.lineBlockAt(start).height });
+					if (performance.now() - t0 < 1000) requestAnimationFrame(tick);
+				};
+				requestAnimationFrame(tick);
+				const line = view.defaultLineHeight * devicePixelRatio;
+				return { x: c.left + 25, y: (c.top + c.bottom) / 2, scale: devicePixelRatio, whole: Math.abs(line - Math.round(line)) <= 0.02 };
+			}, block.start);
+			await page.waitForTimeout(100);
+			await page.mouse.click(below.x, below.y);
+			await page.waitForTimeout(1000);
+			const frames = await page.evaluate(() => window.iwFrames);
+			const before = frames.filter(f => !f.drawn).at(-1);
+			const after = frames.filter(f => f.drawn);
+			const pixel = value => Math.round(value * below.scale);
+			const spread = values => Math.max(...values) - Math.min(...values);
+			const where = `zoom ${zoom}, editor spostato di ${shift} px`;
+			exits++;
+			assert.ok(before && after.length > 20, `${where}: la riga di Markdown e poi la riga ridisegnata (${frames.length} fotogrammi, ${after.length} con la riga disegnata, clic a ${Math.round(below.x)},${Math.round(below.y)})`);
+			assert.equal(below.whole, zoom !== 1.1, `${where}: righe di testo di pixel interi`);
+			const kept = below.whole
+				? after.every(f => pixel(f.line) === pixel(before.line)) && (zoom !== 1 || after.every(f => pixel(f.image) === pixel(before.image)))
+				: Math.abs(after[0].line - before.line) * below.scale <= 0.52;
+			if (!kept) {
+				failures.push(`${where}: riga cliccata ${before.line.toFixed(3)} → ${after[0].line.toFixed(3)}, immagine sotto ${before.image.toFixed(3)} → ${after[0].image.toFixed(3)}`);
+			}
+			assert.ok(spread(after.map(f => f.line)) <= 0.02 && spread(after.map(f => f.image)) <= 0.02, `${where}: si muove dopo il ridisegno`);
+			assert.equal(new Set(after.map(f => f.scroll)).size, 1, `${where}: lo scorrimento cambia dopo il ridisegno`);
+			assert.ok(Math.abs(after[0].line - before.line) < 1 / below.scale, `${where}: la riga cliccata da ${before.line} a ${after[0].line} (scorrimento ${before.scroll} → ${after[0].scroll})`);
+		}
+	} finally {
+		await page.evaluate(() => { require('electron').webFrame.setZoomFactor(1); document.getElementById('iw-test-fase')?.remove(); });
+	}
+	assert.deepEqual(failures, [], `${failures.length} uscite su ${exits} cambiano pixel (con lo zoom: la riga cliccata si sposta di più di mezzo pixel)`);
+});
+
+test('Live Preview: tre ingressi da un punto vuoto, ciascuno chiuso con un clic sopra, non spostano la riga di immagini', async () => {
+	const { page } = obsidian;
+	await openNote(page, 'Ingresso.md', 'live');
+	await page.evaluate(() => window.app.workspace.activeEditor.editor.setCursor(0, 0));
+	await placeLongBlock('Sopra la riga.', '![[a.png|200]]', 350);
+	await imagesShown();
+	const first = await emptyPointEntry('row');
+	for (let cycle = 1; cycle <= 3; cycle++) {
+		const block = await emptyPointEntry('row');
+		assert.ok(Math.abs(block.top - first.top) <= 1, `ciclo ${cycle}: la riga da ${first.top} a ${block.top}`);
+		await page.mouse.click(block.point.x, block.point.y);
+		await page.waitForTimeout(600);
+		// Out with a click on the line above (what is above stays).
+		const above = await page.evaluate(reference => {
+			const c = window.app.workspace.activeEditor.editor.cm.coordsAtPos(reference);
+			return { x: c.left + 30, y: c.top + 6 };
+		}, block.reference);
+		await page.mouse.click(above.x, above.y);
+		await page.waitForTimeout(600);
+	}
+	const last = await emptyPointEntry('row');
+	assert.ok(Math.abs(last.top - first.top) <= 1, `dopo tre cicli la riga da ${first.top} a ${last.top}`);
 });
 
 // A click on a list item, a quote, code or a table inside a wrap puts the
@@ -1084,6 +1643,126 @@ async function openPopoutNote() {
 	return popout;
 }
 
+test('wrap con H2/H3: geometria misurata e mappa delle altezze dopo ingresso e uscita', async () => {
+ const {page} = obsidian;
+ for (const mode of ['live', 'reading']) {
+  await open('TitoliCarrier.md', mode);
+  const geometry = await page.evaluate(selector => [...document.querySelectorAll(`${selector} .iw-preview-content`)]
+   .filter(root => root.getBoundingClientRect().width > 0).map(root => {
+    const heading = root.querySelector('h2, h3');
+    return {tag: heading?.tagName, margin: parseFloat(getComputedStyle(heading).marginTop),
+     carrier: !!root.querySelector('.iw-image-carrier'), image: !!root.querySelector('img')};
+   }), container(mode));
+  assert.equal(geometry.length, 2);
+  assert.ok(geometry.every(item => item.carrier && item.image));
+  if (!process.env.IW_OBSIDIAN_THEME_DIR) assert.ok(geometry.every(item => item.margin === 16), JSON.stringify(geometry));
+  record({kind: 'environment', case: 'heading-carrier-geometry', mode, geometry});
+  if (mode === 'live') {
+   for (let cycle = 0; cycle < 2; cycle++) {
+    await page.evaluate(() => {
+     const editor = window.app.workspace.activeEditor.editor;
+     editor.setCursor(editor.offsetToPos(editor.getValue().indexOf('Titolo due')));
+    });
+    await page.waitForTimeout(300);
+    await page.evaluate(() => {const editor = window.app.workspace.activeEditor.editor;editor.setCursor(editor.lastLine(), 0);});
+    await page.waitForTimeout(400);
+    assert.ok(await heightDrift() <= 1, 'mappa allineata dopo uscita dal wrap con titolo');
+   }
+  }
+ }
+});
+
+test('chiusura nativa: tutte le foglie della separata, principale preservata', async () => {
+ const {page} = obsidian;
+ const popout = await openPopoutNote();
+ try {
+  const count = await popout.evaluate(async () => {
+   const leaves = [];
+   window.app.workspace.iterateAllLeaves(leaf => { if (leaf.getContainer().doc === document) leaves.push(leaf); });
+   const added = window.app.workspace.createLeafBySplit(leaves[0], 'vertical');
+   await added.openFile(window.app.vault.getFileByPath('Ridimensiona.md'), {state: {mode: 'source', source: false}});
+   added.view.editor.setCursor(added.view.editor.lastLine(), 0);
+   const actual = [];
+   window.app.workspace.iterateAllLeaves(leaf => { if (leaf.getContainer().doc === document) actual.push(leaf); });
+   return actual.filter(leaf => leaf.view.getViewType() === 'markdown').length;
+  });
+  assert.equal(count, 2);
+  await popout.waitForSelector('.iw-preview', {state: 'attached'});
+  const mainBefore = await page.evaluate(() => {
+  const leaves = [];
+  window.app.workspace.iterateAllLeaves(leaf => { if (leaf.getContainer().doc === document) leaves.push(leaf); });
+  window.iwMainLeavesBeforeClose = leaves;
+  return leaves.length;
+ });
+  const describe = () => {
+   const leaves = [];
+   window.app.workspace.iterateAllLeaves(leaf => { leaves.push({id: leaf.id, type: leaf.view.getViewType(), file: leaf.view.file?.path,
+    doc: leaf.getContainer().doc === document, win: leaf.getContainer().win === window, viewDoc: leaf.view.containerEl.ownerDocument === document}); });
+   return leaves;
+  };
+  console.log('OWNERSHIP main before', JSON.stringify(await page.evaluate(describe)));
+  console.log('OWNERSHIP popout before', JSON.stringify(await popout.evaluate(describe)));
+  await detachWorkspaceWindow(popout);
+  console.log('OWNERSHIP main after', JSON.stringify(await page.evaluate(describe)));
+  const remaining = await page.evaluate(() => {
+   const leaves = [];
+   window.app.workspace.iterateAllLeaves(leaf => { leaves.push(leaf); });
+   const result = {main: window.iwMainLeavesBeforeClose.every(leaf => leaves.includes(leaf)),
+    count: leaves.filter(leaf => leaf.getContainer().doc === document).length,
+    separate: leaves.filter(leaf => leaf.getContainer().doc !== document).length};
+   delete window.iwMainLeavesBeforeClose;
+   return result;
+  });
+  assert.deepEqual(remaining, {main: true, count: mainBefore, separate: 0});
+ } finally { await detachWorkspaceWindow(popout); }
+});
+
+test('chiusura nativa: senza foglia proprietaria conserva la finestra e segnala il problema', async () => {
+ const popout = await openPopoutNote();
+ try {
+  // Controlled missing-owner condition; genuine post-reload orphans are
+  // exercised separately by banco-errori, including their forced close.
+  await popout.evaluate(() => {
+   const workspace = window.app.workspace;
+   const original = workspace.iterateAllLeaves;
+   window.iwOriginalIteration = original;
+   workspace.iterateAllLeaves = callback => original.call(workspace, leaf => {
+    if (leaf.getContainer().doc !== document) callback(leaf);
+   });
+  });
+  await assert.rejects(detachWorkspaceWindow(popout), /No workspace leaf owns this window/);
+  assert.equal(popout.isClosed(), false);
+ } finally {
+  await popout.evaluate(() => {
+   window.app.workspace.iterateAllLeaves = window.iwOriginalIteration;
+   delete window.iwOriginalIteration;
+  });
+  await detachWorkspaceWindow(popout);
+ }
+});
+
+test('chiusura nativa: un detach senza chiusura produce timeout, senza fallback forzato', async () => {
+ const popout = await openPopoutNote();
+ try {
+  await popout.evaluate(() => {
+   window.app.workspace.iterateAllLeaves(leaf => {
+    if (leaf.getContainer().doc !== document) return;
+    window.iwOriginalDetach = {leaf, detach: leaf.detach};
+    leaf.detach = () => {};
+   });
+  });
+  await assert.rejects(detachWorkspaceWindow(popout), /Timeout/);
+  assert.equal(popout.isClosed(), false, 'il timeout conserva la finestra per la diagnosi');
+ } finally {
+  await popout.evaluate(() => {
+   const {leaf, detach} = window.iwOriginalDetach;
+   leaf.detach = detach;
+   delete window.iwOriginalDetach;
+  });
+  await detachWorkspaceWindow(popout);
+ }
+});
+
 test('finestra separata: righe, wrap, feedback e toolbar sono inizializzati', async () => {
 	const popout = await openPopoutNote();
 	try {
@@ -1097,7 +1776,23 @@ test('finestra separata: righe, wrap, feedback e toolbar sono inizializzati', as
 		assert.equal(state.wrapFloat, 'left');
 		assert.ok(state.marked >= 3, `immagini segnate: ${state.marked}`);
 		assert.equal(state.buttons, 4);
-	} finally { await popout.evaluate(() => window.close()).catch(() => {}); }
+		// The pointer's events in this window: the image under it marks its
+		// region, its resize handle and leaving the window clear the mark.
+		const image = await popout.locator('.iw-row-preview p.iw-row .image-embed img').first().boundingBox();
+		await popout.mouse.move(image.x + image.width / 2, image.y + image.height / 2);
+		await popout.waitForTimeout(100);
+		assert.equal(await popout.evaluate(() => document.querySelectorAll('.iw-row-preview.iw-image-hover').length), 1, 'immagine: regione segnata');
+		const handle = await popout.locator('.iw-row-preview .iw-row-handle').first().boundingBox();
+		await popout.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+		await popout.waitForTimeout(100);
+		assert.equal(await popout.evaluate(() => document.querySelectorAll('.iw-image-hover').length), 0, 'maniglia: nessuna regione segnata');
+		await popout.mouse.move(image.x + image.width / 2, image.y + image.height / 2);
+		await popout.waitForTimeout(100);
+		await popout.mouse.move(2, 2);
+		await popout.waitForTimeout(100);
+		assert.equal(await popout.evaluate(() => document.querySelectorAll('.iw-image-hover').length), 0, 'fuori dall’editor: nessuna regione segnata');
+		assert.equal(await obsidian.page.evaluate(() => document.querySelectorAll('.iw-image-hover').length), 0, 'nella finestra principale nulla');
+	} finally { await detachWorkspaceWindow(popout); }
 });
 
 test('finestra separata: la maniglia sposta una riga', async () => {
@@ -1125,7 +1820,7 @@ test('finestra separata: la maniglia sposta una riga', async () => {
 		assert.ok(text.startsWith('Uno.\n\nDue.\n\n![[a.png|200]] ![[b.png|150]]'), `riga spostata nella finestra separata: ${JSON.stringify(text.slice(0, 60))}`);
 	} finally {
 		if (down) await popout.mouse.up().catch(() => {});
-		await popout.evaluate(() => window.close()).catch(() => {});
+		await detachWorkspaceWindow(popout);
 	}
 });
 
@@ -1417,6 +2112,461 @@ test('nota lunga con 100 righe (live)', async () => {
 	await page.screenshot({ path: join(shots, 'lunga-live.png') });
 	assert.ok(opened < 5000, 'apertura sotto 5 s');
 	assert.ok(scrolled / screens < 100, 'meno di 100 ms per schermata');
+});
+
+// Native sections must retain measurable boxes in embeds and hover previews:
+// Obsidian uses those heights to virtualize the note while scrolling.
+test('Wrap compatti: incorporamento coerente fra Live Preview e Lettura', async () => {
+ const { page } = obsidian;
+ const measurements = [];
+ for (const mode of ['live', 'reading']) {
+  await openNote(page, 'IncorporaCompatto.md', mode);
+  await page.waitForSelector(`${container(mode)} .markdown-embed .iw-reading-section`, { state: 'attached' });
+  await page.waitForTimeout(1200);
+  measurements.push(await page.evaluate(selector => {
+   const view = document.querySelector(`${selector} .markdown-embed .markdown-preview-view`);
+   const root = view.querySelector('.markdown-preview-sizer');
+   const top = root.getBoundingClientRect().top;
+   return { height: root.getBoundingClientRect().height, width: root.getBoundingClientRect().width,
+    positions: [...root.querySelectorAll('p, h2, li, img')].map(el => ({text: el.textContent, y: el.getBoundingClientRect().top - top, height: el.getBoundingClientRect().height})),
+    zeroSections: [...root.querySelectorAll('div.iw-reading-section')].filter(el => !el.getBoundingClientRect().height).length };
+  }, container(mode)));
+  record({kind: 'measurement', context: `compact-embed-${mode}`, ...measurements.at(-1)});
+ }
+ assert.equal(measurements[0].zeroSections, 0, 'sezioni incorporate misurabili in Live Preview');
+ assert.equal(measurements[1].zeroSections, 0, 'sezioni incorporate misurabili in Lettura');
+ assert.ok(Math.abs(measurements[0].height - measurements[1].height) < 0.1, JSON.stringify(measurements));
+ assert.equal(measurements[0].positions.length, measurements[1].positions.length);
+ for (let i = 0; i < measurements[0].positions.length; i++) {
+  assert.ok(Math.abs(measurements[0].positions[i].y - measurements[1].positions[i].y) < 0.1, `blocco ${i}: ${JSON.stringify(measurements)}`);
+ }
+});
+
+test('Wrap compatti: anteprima al passaggio scorre senza perdere altezza', async () => {
+ const { page } = obsidian;
+ await openNote(page, 'IncorporaCompatto.md', 'reading');
+ const link = page.locator('.workspace-leaf.mod-active a.internal-link[data-href="Compatto"]').first();
+ await page.keyboard.down('Control');
+ await link.hover();
+ await page.waitForTimeout(300);
+ await link.hover({ position: { x: 3, y: 3 } });
+ await page.keyboard.up('Control');
+ const selector = '.popover.hover-popover .markdown-embed .markdown-preview-view';
+ await page.waitForSelector(`${selector} .iw-reading-section`);
+ await page.locator(selector).hover();
+ await page.waitForTimeout(1200);
+ const steps = [];
+ for (let i = 0; i < 40; i++) {
+  const before = await page.locator(selector).evaluate(view => {
+   const result = { top: view.scrollTop, height: view.scrollHeight, client: view.clientHeight };
+   view.scrollTop += 80;
+   return result;
+  });
+  await page.waitForTimeout(250);
+  const after = await page.locator(selector).evaluate(view => ({top: view.scrollTop, height: view.scrollHeight, client: view.clientHeight}));
+  steps.push({before, after});
+  assert.ok(after.height >= before.height - 2, `altezza persa: ${JSON.stringify(steps)}`);
+  assert.ok(after.top >= before.top - 1, `scorrimento indietro: ${JSON.stringify(steps)}`);
+  if (after.top + after.client >= after.height - 1) break;
+ }
+ assert.ok(steps.length > 3, 'anteprima realmente scorsa');
+ const last = steps.at(-1).after;
+ assert.ok(last.top + last.client >= last.height - 1, 'raggiunto il fondo');
+ await page.keyboard.press('Escape');
+});
+
+test('MarkdownRenderer: blocchi diretti senza sezioni el-p', async () => {
+ const { page } = obsidian;
+ for (const mode of ['live', 'reading']) {
+  await openNote(page, 'Wrap.md', mode);
+  if (mode === 'live') await page.evaluate(() => { const e = window.app.workspace.activeEditor.editor; e.setCursor(e.lastLine(), 0); });
+  await page.waitForSelector('.iw-preview-content > p', { state: 'attached' });
+  const dom = await page.locator('.iw-preview-content').first().evaluate(root => ({children: [...root.children].map(el => el.tagName), sections: root.querySelectorAll('.el-p').length}));
+  assert.ok(dom.children.includes('P'), JSON.stringify(dom));
+  assert.equal(dom.sections, 0, JSON.stringify(dom));
+ }
+});
+
+test('Wrap compatti: sezioni misurabili nella finestra separata', async () => {
+ const { page } = obsidian;
+ const opened = page.context().waitForEvent('page');
+ await page.evaluate(async () => {
+  const leaf = window.app.workspace.openPopoutLeaf();
+  await leaf.openFile(window.app.vault.getFileByPath('IncorporaCompatto.md'), {state: {mode: 'source', source: false}});
+ });
+ const popout = await opened;
+ try {
+  for (const mode of ['live', 'reading']) {
+   await openNote(popout, 'IncorporaCompatto.md', mode);
+   await popout.waitForSelector(`${container(mode)} .markdown-embed .iw-reading-section`, {state: 'attached'});
+   await popout.waitForTimeout(800);
+   const heights = await popout.locator(`${container(mode)} .markdown-embed div.iw-reading-section`).evaluateAll(elements => elements.map(el => el.getBoundingClientRect().height));
+   assert.ok(heights.length >= 7 && heights.every(height => height > 0), JSON.stringify(heights));
+  }
+ } finally { await detachWorkspaceWindow(popout); await page.evaluate(() => window.dispatchEvent(new FocusEvent('focus'))); }
+});
+
+test('PDF: wrap compatto conserva l’avviso di formato senza impaginazione', async () => {
+ const { printed } = await exportPdf('Compatto.md', 'compatto.pdf', view => ({
+  warning: [...document.querySelectorAll('.notice')].map(el => el.textContent).join('\n'), floats: [...view.querySelectorAll('.image-embed')].map(el => getComputedStyle(el).float),
+ }));
+ assert.ok(printed.warning.includes('markers touch the text'), printed.warning);
+ assert.ok(printed.floats.length >= 2 && printed.floats.every(value => value === 'none'), JSON.stringify(printed));
+});
+
+test('Wrap separati: incorporamenti in Live Preview e Lettura mantengono il float', async () => {
+ const {page} = obsidian;
+ for (const mode of ['live', 'reading']) {
+  await openNote(page, 'IncorporaWrap.md', mode);
+  const selector = `${container(mode)} .markdown-embed .iw-preview-content`;
+  await page.waitForSelector(`${selector} img`);
+  const state = await page.locator(selector).evaluate(root => {
+   const image = root.querySelector('.iw-left');
+   const box = image.getBoundingClientRect();
+   const parent = root.getBoundingClientRect();
+   return {float: getComputedStyle(image).float, width: box.width, contained: box.bottom <= parent.bottom + 1, sections: root.querySelectorAll('.el-p').length};
+  });
+  assert.equal(state.float, 'left');
+  assert.ok(state.width > 0 && state.contained, JSON.stringify(state));
+  assert.equal(state.sections, 0);
+ }
+});
+
+test('DOM di stampa: nota incorporata con wrap separato, primo paragrafo allineato all’immagine', async () => {
+ const {printed} = await exportPdf('IncorporaWrap.md', 'incorpora-wrap.pdf', view => {
+  const embed = view.querySelector('.markdown-embed .image-embed.iw-left');
+  const image = embed?.querySelector('img');
+  const carrier = embed?.parentElement;
+  const next = carrier?.nextElementSibling;
+  const imageBox = image?.getBoundingClientRect();
+  const textBox = next?.getBoundingClientRect();
+  return {found: {embed: Boolean(embed), image: Boolean(image),
+   carrier: Boolean(carrier?.matches('div.iw-image-carrier.iw-export-block')),
+   paragraph: Boolean(next?.matches('p.iw-export-after-carrier.iw-first-paragraph'))},
+   src: embed?.getAttribute('src'), text: next?.textContent,
+   float: embed ? getComputedStyle(embed).float : null, loaded: Boolean(image?.complete && image.naturalWidth > 0),
+   imageWidth: imageBox?.width, imageHeight: imageBox?.height,
+   imageTop: imageBox?.top, textTop: textBox?.top,
+   delta: imageBox && textBox ? textBox.top - imageBox.top : null};
+ });
+ record({kind: 'measurement', context: 'pdf-embedded-wrap', ...printed});
+ assert.deepEqual(printed.found, {embed: true, image: true, carrier: true, paragraph: true}, 'elementi attesi nel wrap incorporato');
+ assert.equal(printed.src, 'b.png', 'immagine della fixture incorporata');
+ assert.ok(printed.text?.startsWith('Testo accanto all’immagine.'), 'primo paragrafo della fixture incorporata');
+ assert.equal(printed.float, 'left');
+ assert.equal(printed.loaded, true, 'immagine caricata');
+ assert.ok(printed.imageWidth > 0 && printed.imageHeight > 0, 'immagine caricata e misurabile');
+ assert.ok(Number.isFinite(printed.imageTop) && Number.isFinite(printed.textTop), 'coordinate superiori numeriche e finite');
+ assert.equal(typeof printed.delta, 'number', 'misura del disallineamento presente e numerica');
+ assert.ok(Number.isFinite(printed.delta), 'misura del disallineamento finita');
+ // CSS pixels in the print DOM, not glyph baselines or coordinates in the PDF.
+ // Allow subpixel layout (including the carrier's 1/64 px padding), up to
+ // half a CSS pixel; a full-pixel displacement must never pass.
+ assert.ok(Math.abs(printed.delta) <= 0.5, `primo paragrafo allineato all’immagine entro 0,5 px CSS: ${JSON.stringify(printed)}`);
+});
+
+// Reads an exported PDF with the pdf.js Obsidian loads for its own viewer
+// (present once a PDF has been opened): per page, its text and images.
+async function pdfPages(pdf, name) {
+ const {page} = obsidian;
+ await copyFile(pdf, join(vault, name));
+ await page.waitForFunction(path => window.app.vault.getFileByPath(path) !== null, name, {timeout: 10000});
+ if (!await page.evaluate(() => Boolean(window.pdfjsLib))) {
+  await page.evaluate(async path => { await window.app.workspace.getLeaf(false).openFile(window.app.vault.getFileByPath(path)); }, name);
+  await page.waitForFunction(() => Boolean(window.pdfjsLib), null, {timeout: 15000});
+ }
+ return page.evaluate(async path => {
+  const lib = window.pdfjsLib;
+  const doc = await lib.getDocument({data: new Uint8Array(await window.app.vault.adapter.readBinary(path))}).promise;
+  const pages = [];
+  for (let n = 1; n <= doc.numPages; n++) {
+   const pdfPage = await doc.getPage(n);
+   const text = (await pdfPage.getTextContent()).items.map(item => item.str).filter(str => str.trim());
+   const ops = await pdfPage.getOperatorList();
+   pages.push({text, images: ops.fnArray.filter(fn => fn === lib.OPS.paintImageXObject || fn === lib.OPS.paintInlineImageXObject).length});
+  }
+  await doc.destroy();
+  return pages;
+ }, name);
+}
+
+test('PDF: nota incorporata che inizia sotto il proprio titolo anche al confine di un’immagine', async () => {
+ const {page} = obsidian;
+ const outcomes = [];
+ const exportAt = async offset => {
+  const note = `ConfineIncorporato${outcomes.length}`;
+  await writeFile(join(vault, `${note}.md`), `${confineSpacer(offset)}\n\nNota incorporata di confronto.\n\n![[ConfineCasi]]\n\nFine.\n`);
+  await page.waitForFunction(path => window.app.vault.getFileByPath(path) !== null, `${note}.md`, {timeout: 10000});
+  const {pdf} = await exportPdf(`${note}.md`, `${note}.pdf`, view => view.querySelectorAll('.image-embed').length);
+  const pages = await pdfPages(pdf, `${note}.pdf`);
+  const pageOf = text => pages.findIndex(page => page.text.some(str => str.startsWith(text))) + 1;
+  // The fifth image is the right-heading wrap's: the page it starts on.
+  let seen = 0;
+  const o = {offset, pages: pages.length, title: pageOf('ConfineCasi'), first: pageOf('PRIMA left-heading'), headingPage: pageOf('Titolo right-heading'), imagePage: pages.findIndex(page => (seen += page.images) >= 5) + 1};
+  // fits: the image on page 1 beside its heading; split: the image alone on
+  // the next page (a known limit, not this fix's); pushed: the whole embedded
+  // note after its title, the defect.
+  o.state = o.first > o.title ? 'pushed'
+   : o.first !== o.title || o.headingPage !== o.title ? 'other'
+   : o.imagePage === o.headingPage ? 'fits' : o.imagePage === o.headingPage + 1 ? 'split' : 'other';
+  outcomes.push(o);
+  return o;
+ };
+ // Sentinel: the image must fit at the low end and not at the high end, then
+ // a bisection finds where it stops fitting to within CONFINE_STEP. The first
+ // export past that point is inside the window where the defect sends the
+ // note on. A fixture moved so far that the search cannot find that point
+ // fails here, apart from the defect.
+ let [fits, past] = CONFINE_RANGE;
+ const low = await exportAt(fits), high = await exportAt(past);
+ let found = low.state === 'fits' && ['split', 'pushed'].includes(high.state);
+ while (found && past - fits > CONFINE_STEP) {
+  const middle = (fits + past) / 2;
+  const o = await exportAt(middle);
+  if (o.state === 'fits') fits = middle;
+  else if (o.state === 'other') found = false;
+  else past = middle;
+ }
+ record({kind: 'measurement', context: 'pdf-embedded-page-boundary', range: CONFINE_RANGE, step: CONFINE_STEP, fits, past, outcomes});
+ assert.ok(found, `sentinella: la fixture non incontra più il confine dell’immagine in ${JSON.stringify(CONFINE_RANGE)} px: ${JSON.stringify(outcomes)}`);
+ assert.deepEqual(outcomes.filter(o => o.state === 'pushed'), [], 'contenuto incorporato sotto il proprio titolo');
+});
+
+test('Wrap separati: anteprima al passaggio contiene immagine e testo', async () => {
+ const {page} = obsidian;
+ await openNote(page, 'IncorporaWrap.md', 'reading');
+ const link = page.locator(`${container('reading')} a.internal-link[data-href="Wrap"]`).first();
+ await page.keyboard.down('Control');
+ await link.hover();
+ await page.waitForTimeout(300);
+ await link.hover({position: {x: 3, y: 3}});
+ await page.keyboard.up('Control');
+ const preview = page.locator('.hover-popover .iw-preview-content');
+ await preview.waitFor();
+ const geometry = await preview.evaluate(root => {
+  const image = root.querySelector('.iw-left');
+  return {float: getComputedStyle(image).float, contained: image.getBoundingClientRect().bottom <= root.getBoundingClientRect().bottom + 1, sections: root.querySelectorAll('.el-p').length};
+ });
+ assert.equal(geometry.float, 'left');
+ assert.ok(geometry.contained);
+ assert.equal(geometry.sections, 0);
+ await page.keyboard.press('Escape');
+});
+
+test('Wrap compatti: nota diretta in Live Preview e Lettura', async () => {
+ const {page} = obsidian;
+ for (const mode of ['live', 'reading']) {
+  await openNote(page, 'Compatto.md', mode);
+  if (mode === 'live') await page.evaluate(() => {const e = window.app.workspace.activeEditor.editor; e.setCursor(e.lastLine(), 0);});
+  await page.waitForSelector(`${container(mode)} .image-embed.iw-left`);
+  const geometry = await page.locator(`${container(mode)} .image-embed.iw-left`).first().evaluate(image => ({float: getComputedStyle(image).float, width: image.getBoundingClientRect().width}));
+  assert.equal(geometry.float, 'left');
+  assert.ok(geometry.width > 0);
+ }
+});
+
+// Real clicks need the pointer's target free. An earlier test can leave the
+// pointer over a link, and Obsidian's hover preview then covers the editor and
+// takes the clicks: move the pointer off it and wait until no preview is open.
+async function pointerAway() {
+	const { page } = obsidian;
+	await page.mouse.move(0, 0);
+	await page.waitForFunction(() => !document.querySelector('.popover.hover-popover'), null, { timeout: 5000 });
+}
+
+// What a real click at `point` would reach: it must be inside `selector`.
+async function assertHits(point, selector, what) {
+	const hit = await obsidian.page.evaluate(({ x, y, selector }) => {
+		const element = document.elementFromPoint(x, y);
+		return { inside: Boolean(element?.closest(selector)), element: element && `${element.tagName}.${[...element.classList].join('.')}` };
+	}, { x: point.x, y: point.y, selector });
+	assert.ok(hit.inside, `${what}: il punto del clic è coperto da ${hit.element}`);
+}
+
+test('wrap: clic sotto il Markdown mantiene gutter e secondo clic allineati', async () => {
+ const {page} = obsidian;
+ const states = [];
+ const snapshot = async label => {
+  const data = await page.evaluate(() => {
+   const view = window.app.workspace.activeEditor.editor.cm;
+   const geometry = element => {
+    const rect = element.getBoundingClientRect();
+    return {top: rect.top, height: rect.height};
+   };
+   const lines = [...view.dom.querySelectorAll('.cm-line')].map(geometry);
+   const gutters = [...view.dom.querySelectorAll('.cm-lineNumbers .cm-gutterElement')]
+    .filter(element => element.getBoundingClientRect().height > 0).map(geometry);
+   const wrap = view.dom.querySelector('.iw-preview:not(.iw-row-preview)');
+   return {lines, gutters, wrap: wrap ? geometry(wrap) : null, cursor: view.state.selection.main.head};
+  });
+  states.push({label, ...data});
+  return data;
+ };
+ const below = async () => page.evaluate(() => {
+  const lines = [...document.querySelectorAll('.workspace-leaf.mod-active .cm-line')];
+  const marker = lines.find(line => line.textContent.includes('[wrap:end]'));
+  const wrap = lines.find(line => line.querySelector('.iw-preview:not(.iw-row-preview)'));
+  const rect = (marker ?? wrap).nextElementSibling.getBoundingClientRect();
+  return {x: rect.left + 60, y: rect.top + rect.height / 2};
+ });
+ await page.evaluate(() => window.app.vault.setConfig('showLineNumber', true));
+ try {
+  await open('GutterUscita.md', 'live');
+  await pointerAway();
+  await snapshot('initial');
+  const heading = await page.locator('.workspace-leaf.mod-active .iw-preview-content h2').boundingBox();
+  const entry = { x: heading.x + heading.width / 2, y: heading.y + heading.height / 2 };
+  await assertHits(entry, '.workspace-leaf.mod-active .iw-preview-content h2', 'ingresso');
+  await page.mouse.click(entry.x, entry.y);
+  await page.waitForTimeout(200);
+  assert.equal((await snapshot('source')).wrap, null, 'il clic entra nel Markdown');
+  const point = await below();
+  await assertHits(point, '.workspace-leaf.mod-active .cm-content', 'uscita');
+  await page.mouse.click(point.x, point.y);
+  await page.waitForTimeout(500);
+  const exit = await snapshot('exit');
+  assert.ok(exit.wrap, 'il primo clic chiude il Markdown');
+  assert.equal(exit.lines.length, exit.gutters.length);
+  assert.ok(exit.lines.every((line, index) => Math.abs(line.top - exit.gutters[index].top) <= 1), JSON.stringify(exit));
+  assert.ok(Math.abs(exit.wrap.height - exit.gutters[2].height) <= 1, 'cella del wrap misurata all’altezza reale');
+  const secondPoint = await below();
+  await assertHits(secondPoint, '.workspace-leaf.mod-active .cm-content', 'secondo clic');
+  await page.mouse.click(secondPoint.x, secondPoint.y);
+  await page.waitForTimeout(200);
+  const second = await snapshot('second');
+  assert.ok(second.wrap, 'il secondo clic resta fuori dal Markdown');
+  assert.equal(second.cursor, exit.cursor);
+  assert.ok(second.lines.every((line, index) => Math.abs(line.top - second.gutters[index].top) <= 1));
+ } finally {
+  record({kind: 'environment', case: 'wrap-gutter-exit', states});
+  await page.evaluate(() => window.app.vault.setConfig('showLineNumber', false));
+ }
+});
+
+// Leaving a block's Markdown with a real click, measured at every frame from
+// before the click: the clicked line keeps its place (above the block
+// CodeMirror keeps the top still), line numbers stay on their lines in every
+// frame, and the block is drawn once (a widget drawn again repeats its
+// intermediate layout). Far from the note's ends, where the rule holds.
+async function exitAndMeasure(block, clicked, enter, top) {
+	const { page } = obsidian;
+	// The block `top` px below the editor's top: near it for an exit below
+	// (its Markdown then fits), lower for an exit above.
+	// Again until measured: a block far away is placed by estimated heights.
+	for (let i = 0; i < 4; i++) {
+		await page.evaluate(({ block, top }) => {
+			const view = window.app.workspace.activeEditor.editor.cm;
+			const from = view.state.doc.toString().indexOf(block);
+			view.scrollDOM.scrollTop += view.documentTop + view.lineBlockAt(from).top - view.scrollDOM.getBoundingClientRect().top - top;
+		}, { block, top });
+		await page.waitForTimeout(250);
+	}
+	const target = await page.evaluate(({ block, enter }) => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		const from = view.state.doc.toString().indexOf(block);
+		const root = [...view.contentDOM.querySelectorAll('.iw-preview')].find(e => view.posAtDOM(e) === from);
+		const element = root?.querySelector(enter) ?? root;
+		const r = element?.getBoundingClientRect();
+		if (!r) return null;
+		const point = enter ? { x: r.left + r.width / 2, y: r.top + Math.min(r.height / 2, 30) } : { x: r.right - 20, y: r.top + r.height / 2 };
+		const hit = document.elementFromPoint(point.x, point.y);
+		return { ...point, hit: hit && `${hit.tagName}.${[...hit.classList].join('.')}` };
+	}, { block, enter });
+	assert.ok(target, `${block}: blocco disegnato`);
+	await assertHits(target, '.workspace-leaf.mod-active .cm-content .iw-preview', `${block}: ingresso`);
+	await page.mouse.click(target.x, target.y);
+	await page.waitForTimeout(600);
+	const point = await page.evaluate(({ block, clicked }) => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		const text = view.state.doc.toString();
+		const from = text.indexOf(block);
+		if ([...view.contentDOM.querySelectorAll('.iw-preview')].some(e => view.posAtDOM(e) === from)) return { open: false };
+		const at = text.indexOf(clicked);
+		const c = view.coordsAtPos(at);
+		const box = view.scrollDOM.getBoundingClientRect();
+		return { open: true, x: c.left + 25, y: (c.top + c.bottom) / 2, visible: c.top > box.top + 10 && c.bottom < box.bottom - 10 };
+	}, { block, clicked });
+	assert.ok(point.open, `${block}: il clic apre il Markdown (colpito ${target.hit})`);
+	assert.ok(point.visible, `${clicked}: riga da cliccare visibile (${JSON.stringify(point)})`);
+	await page.evaluate(({ block, clicked }) => {
+		const view = window.app.workspace.activeEditor.editor.cm;
+		const text = view.state.doc.toString();
+		const from = text.indexOf(block), at = text.indexOf(clicked);
+		const gutter = () => {
+			let worst = 0;
+			for (const element of view.dom.querySelectorAll('.cm-lineNumbers .cm-gutterElement')) {
+				const n = Number(element.textContent);
+				const r = element.getBoundingClientRect();
+				if (!n || r.height === 0 || n > view.state.doc.lines) continue;
+				const node = view.domAtPos(view.state.doc.line(n).from).node;
+				const line = (node.nodeType === 1 ? node : node.parentElement)?.closest('.cm-line');
+				if (!line) continue;
+				const l = line.getBoundingClientRect();
+				if (l.bottom < 0 || l.top > innerHeight) continue;
+				worst = Math.max(worst, Math.abs(l.top - r.top), Math.abs(l.height - r.height));
+			}
+			return worst;
+		};
+		// Distinct drawn elements: CodeMirror may also move a line it keeps.
+		const seen = new Set();
+		const probe = window.iwExitProbe = { frames: [], drawn: 0 };
+		const mine = node => { try { return node.nodeType === 1 && node.matches('.iw-preview') && view.posAtDOM(node) === from; } catch { return false; } };
+		const note = node => { if (mine(node) && !seen.has(node)) { seen.add(node); probe.drawn++; } };
+		probe.observer = new MutationObserver(records => {
+			for (const record of records) for (const node of record.addedNodes) {
+				if (node.nodeType !== 1) continue;
+				note(node);
+				for (const inner of node.querySelectorAll('.iw-preview')) note(inner);
+			}
+		});
+		probe.observer.observe(view.contentDOM, { childList: true, subtree: true });
+		const t0 = performance.now();
+		const tick = () => {
+			probe.frames.push({ drawn: [...view.contentDOM.querySelectorAll('.iw-preview')].some(e => { try { return view.posAtDOM(e) === from; } catch { return false; } }),
+				line: view.coordsAtPos(at)?.top ?? null, gutter: gutter() });
+			if (performance.now() - t0 < 1000) requestAnimationFrame(tick); else probe.observer.disconnect();
+		};
+		requestAnimationFrame(tick);
+	}, { block, clicked });
+	// A few frames of the Markdown before the click, the reference for the line.
+	await page.waitForFunction(() => window.iwExitProbe.frames.length >= 3);
+	await assertHits(point, '.workspace-leaf.mod-active .cm-content', `${clicked}: uscita`);
+	await page.mouse.click(point.x, point.y);
+	await page.waitForTimeout(1100);
+	const { frames, drawn } = await page.evaluate(() => window.iwExitProbe);
+	const before = frames.filter(f => !f.drawn).at(-1), after = frames.filter(f => f.drawn);
+	return { frames: frames.length, after: after.length, drawn, shift: before && after.length ? Math.max(...after.map(f => Math.abs(f.line - before.line))) : null,
+		gutter: Math.max(...frames.map(f => f.gutter)), gutterFrames: frames.filter(f => f.gutter > 1).length };
+}
+
+test('uscita col clic: riga cliccata ferma, numeri di riga allineati in ogni fotogramma, blocco disegnato una volta', async () => {
+	const { page } = obsidian;
+	await page.evaluate(() => window.app.vault.setConfig('showLineNumber', true));
+	const results = [];
+	try {
+		// Not open(): its caret at the last line leaves these blocks off screen.
+		await openNote(page, 'UscitaTitoli.md', 'live');
+		await pointerAway();
+		await page.evaluate(() => window.app.workspace.activeEditor.editor.setCursor(0, 0));
+		await page.waitForTimeout(800);
+		const cases = [
+			['H2 sinistra, sotto', '[wrap:start] %%iw-wrap side=left%%\n\n![[gutter-tall.png|167]]\n\n## Titolo due', 'Sotto wrap H2.', 'h2', 3],
+			['H2 sinistra, sopra', '[wrap:start] %%iw-wrap side=left%%\n\n![[gutter-tall.png|167]]\n\n## Titolo due', 'Sopra wrap H2.', 'h2', 1],
+			['H3 destra, sotto', '[wrap:start] %%iw-wrap side=right%%', 'Sotto wrap H3.', 'h3', 2],
+			['H3 destra, sopra', '[wrap:start] %%iw-wrap side=right%%', 'Sopra wrap H3.', 'h3', 1],
+			['senza titolo, sotto', '[wrap:start] %%iw-wrap side=left%%\n\n![[gutter-tall.png|167]]\n\nParagrafo', 'Sotto wrap semplice.', '.iw-first-paragraph', 1],
+			['riga di immagini, sotto', '![[a.png|180]] ![[gutter-tall.png|180]]', 'Sotto riga.', null, 1],
+		];
+		for (const [name, block, clicked, enter, cycles] of cases) for (let cycle = 1; cycle <= cycles; cycle++) {
+			const result = { name, cycle, ...await exitAndMeasure(block, clicked, enter, name.endsWith('sopra') ? 480 : 20) };
+			results.push(result);
+		}
+	} finally {
+		record({ kind: 'environment', case: 'exit-click-frames', results });
+		await page.evaluate(() => window.app.vault.setConfig('showLineNumber', false));
+	}
+	const failures = results.filter(r => !(r.after > 20 && r.shift !== null && r.shift <= 1 && r.gutter <= 1 && r.drawn === 1));
+	assert.deepEqual(failures, [], JSON.stringify(results));
 });
 
 test('nessun errore o avviso del plugin nella console di Obsidian', async () => {

@@ -1,6 +1,8 @@
 // Which Obsidian build of .obsidian-test/ the real-app suite runs: the one
-// named by IW_OBSIDIAN_VERSIONE (e.g. 1.13.0, the minimum the plugin declares),
-// or else the newest, by version number (1.13.10 comes after 1.13.7).
+// named by IW_OBSIDIAN_VERSIONE (e.g. 1.13.4, the minimum app version in
+// manifest.json), or else the newest by version (1.13.10 comes after 1.13.7).
+// The obsidian API package pinned to 1.13.0 is a separate type-check baseline;
+// it does not select the app build.
 
 const numbers = name => name.slice('obsidian-'.length).split('.').map(Number);
 

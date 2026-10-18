@@ -57,7 +57,11 @@ export function renderReadingWrap(element: HTMLElement, wrap: OwnedWrap, app: Ap
 	// Native embeds become images after rendering: lay them out when they do.
 	const observer = new (windowOf(element).MutationObserver)(refresh);
 	observer.observe(content, { subtree: true, childList: true, attributes: true, attributeFilter: ['class'] });
-	void MarkdownRenderer.render(app, wrap.markdown, content, sourcePath, component).then(refresh).catch(() => {
+	const rendering = MarkdownRenderer.render(app, wrap.markdown, content, sourcePath, component);
+	// Its content is there before the promise settles: lay it out before
+	// anything measures the section, as the Live Preview widget does.
+	refresh();
+	void rendering.then(refresh).catch(() => {
 		if (!alive) return;
 		content.textContent = wrap.markdown;
 		content.classList.add('iw-preview-fallback');

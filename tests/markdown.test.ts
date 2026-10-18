@@ -297,8 +297,9 @@ function interactionFixture() {
 	const target = { closest: (selector: string) => ['.image-embed', '.iw-block-toolbar'].includes(selector) ? null : root, parentElement: root } as unknown as HTMLElement;
 	let nextPosition = source.length;
 	let focused = false;
-	// Effects dispatched with the transactions, in order.
+	// Effects dispatched with the transactions, in order, and measure requests.
 	const effects: unknown[] = [];
+	const measures: unknown[] = [];
 	const view = {
 		state: stateAt(),
 		dom: { ownerDocument: doc },
@@ -306,13 +307,14 @@ function interactionFixture() {
 		scrollDOM: { getBoundingClientRect: () => ({ top: 40 }) },
 		dispatch(spec: Parameters<EditorState['update']>[0]) { this.state = this.state.update(spec).state; effects.push(...[(spec as { effects?: unknown }).effects ?? []].flat()); },
 		focus() { focused = true; },
+		requestMeasure(request: unknown) { measures.push(request); },
 		posAtCoords() { return nextPosition; },
 		// The widget starts at the region; stored positions are relative to it.
 		posAtDOM() { return source.indexOf(START); },
 	};
 	previewTargets.set(root, { length: source.indexOf(END) + END.length - source.indexOf(START), fallback: source.indexOf('Testo.') - source.indexOf(START) });
 	const controller = new PreviewInteraction(view as unknown as EditorView);
-	return { controller, view, target, root, doc, effects, focused: () => focused, destination: (pos: number) => { nextPosition = pos; } };
+	return { controller, view, target, root, doc, effects, measures, focused: () => focused, destination: (pos: number) => { nextPosition = pos; } };
 }
 
 test('rendered-section mapping places a click at the corresponding source line, with safe fallback', () => {
@@ -363,7 +365,7 @@ test('enter on a focused preview activates source, without consuming enter from 
 });
 
 test('primary click activates source at mapped position without changing Markdown', () => {
-	const { controller, view, target, focused, effects } = interactionFixture();
+	const { controller, view, target, focused, effects, measures } = interactionFixture();
 	try {
 		const event = pointer('pointerdown', target);
 		assert.equal(controller.pointerdown(event), true);
@@ -372,10 +374,16 @@ test('primary click activates source at mapped position without changing Markdow
 		assert.equal(previews(view.state).length, 0);
 		assert.equal(view.state.doc.toString(), source);
 		assert.ok(focused());
-		// The clicked line goes back where the clicked element was: 100 px below
-		// the scroller's top.
-		const scroll = (effects[0] as { value: { range: { head: number }; y: string; yMargin: number } }).value;
-		assert.deepEqual([scroll.range.head, scroll.y, scroll.yMargin], [source.indexOf('Testo.'), 'start', 100]);
+		// The top of the clicked line goes back where the clicked element was (140
+		// on screen), corrected in CodeMirror's measure phase: no scroll target
+		// for the caret, which would align the caret, not the line. The element
+		// here is the block itself, so the line is the block's first.
+		assert.equal(effects.filter(effect => (effect as { value?: { yMargin?: number } }).value?.yMargin !== undefined).length, 0);
+		const request = measures[0] as { read(view: unknown): number; write(offset: number, view: unknown): void };
+		const laidOut = { documentTop: 0, lineBlockAt: (pos: number) => ({ top: pos === source.indexOf(START) ? 160 : Number.NaN }), scrollDOM: { scrollTop: 500 } };
+		const offset = request.read(laidOut);
+		request.write(offset, laidOut);
+		assert.deepEqual([offset, laidOut.scrollDOM.scrollTop], [20, 520]);
 	} finally { controller.destroy(); }
 });
 

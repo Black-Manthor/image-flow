@@ -61,13 +61,16 @@ const environment = run => {
 	return [run.info?.coverage ? 'coverage' : '', env.obsidian ? `Obsidian ${env.obsidian}` : '', env.chromium ? `Chromium ${env.chromium}` : '',
 		run.info?.platform ?? '', run.info?.node ? `Node ${run.info.node.replace(/^v/, '')}` : ''].filter(Boolean).join(', ');
 };
-const counts = run => `✔ ${run.passedCount}${run.failedCount ? ` ✖ ${run.failedCount}` : ''}${run.skippedCount ? ` ↷ ${run.skippedCount}` : ''}`;
-const consoleNote = run => consoleReviewLabel(run.consoleOutcome) ? ` · ${consoleReviewLabel(run.consoleOutcome)}` : '';
-const mark = { superata: '✔', fallita: '✖', 'fallita (nessun test eseguito)': '✖', interrotta: '⚠', 'in corso': '…', 'non determinabile': '?' };
+const counts = run => run.end?.nativeCounts ? `✔ ${run.end.nativeCounts.passed} ✖ ${run.end.nativeCounts.failed} ⊘ ${run.end.nativeCounts.cancelled} ↷ ${run.end.nativeCounts.skipped} todo ${run.end.nativeCounts.todo} · ${run.end.nativeCounts.tests} test, ${run.end.nativeCounts.suites} suite` : `✔ ${run.passedCount}${run.failedCount ? ` ✖ ${run.failedCount}` : ''}${run.skippedCount ? ` ↷ ${run.skippedCount}` : ''}`;
+const consoleNote = run => (consoleReviewLabel(run.consoleOutcome) ? ` · ${consoleReviewLabel(run.consoleOutcome)}` : '') + (run.end?.consoleNode?.incomplete ? ` · raccolta incompleta, recupero: ${run.end.consoleNode.recovery ?? 'percorso non disponibile'}` : '');
+const mark = { superata: '✔', 'superata con segnalazioni': '⚠', fallita: '✖', 'fallita (nessun test eseguito)': '✖', interrotta: '⚠', 'in corso': '…', 'non determinabile': '?' };
 
-// --- Build, API compatibility and lint ---------------------------------------
-title('Build, compatibilità API latest e lint');
-for (const name of ['build', 'check:latest', 'lint']) {
+// --- Build, API compatibility, lint and the tests' type check -----------------
+title('Build, compatibilità API latest, lint e tipi dei test');
+// What a tool counted (ESLint, esbuild), by phase; unknown when it could not say.
+const counted = command => (command.diagnostics ?? []).map(item => Number.isInteger(item.errors)
+	? `${item.phase}: ${item.errors} errori, ${item.warnings} avvisi` : `${item.phase}: conteggio non disponibile`).join('; ');
+for (const name of ['build', 'check:latest', 'lint', 'lint:css', 'check:tests']) {
 	const run = report.latestCommandRuns.get(name);
 	if (!run) { console.log(`${name}: mai avviato nel periodo.`); continue; }
 	const command = run.commands.at(-1);
@@ -76,8 +79,21 @@ for (const name of ['build', 'check:latest', 'lint']) {
 		console.log(`${name}: ${outcome}, avviato ${when(run.time)}  [${code(run.info)}]`);
 		continue;
 	}
-	const outcome = command.ok ? 'superato' : command.status === 'interrupted' ? `interrotto (${command.signal ?? 'segnale non disponibile'})` : `fallito (uscita ${command.exitCode ?? '?'})`;
+	// Exit 0 with a printed report (lint:css) or with problems counted (lint,
+	// build) is not «clean»; counts the tool could not give are said so.
+	const counts = counted(command);
+	const unknown = (command.diagnostics ?? []).some(item => !Number.isInteger(item.errors));
+	const outcome = command.ok
+		? (command.reported ? `superato con segnalazioni (${counts ? `${counts}; ` : ''}vedere il suo output)` : unknown ? `superato, ${counts}` : 'superato')
+		: command.status === 'interrupted' ? `interrotto (${command.signal ?? 'segnale non disponibile'}${counts ? `; ${counts}` : ''})` : `fallito (uscita ${command.exitCode ?? '?'}${counts ? `; ${counts}` : ''})`;
 	console.log(`${name}: ${outcome}, fase ${command.phase}, ${command.ms} ms, ultimo ${when(command.time)}  [${code(run.info)}]${command.diagnostic ? `\n    ${firstLine(command.diagnostic)}` : ''}`);
+	// The first problems the tool described, the others only counted.
+	for (const item of (command.diagnostics ?? []).flatMap(entry => entry.items ?? []).slice(0, 5)) {
+		const where = item.file ? `${item.file}${item.line ? `:${item.line}:${item.column}` : ''} ` : '';
+		console.log(`    ${item.severity === 'error' ? '✖' : '⚠'} ${where}${firstLine(item.message ?? '')}${item.rule || item.id ? ` (${item.rule ?? item.id})` : ''}`);
+	}
+	const more = (command.diagnostics ?? []).reduce((sum, entry) => sum + (entry.items?.length ?? 0) + (entry.omitted ?? 0), 0) - 5;
+	if (more > 0) console.log(`    … altre ${more} segnalazioni (le prime 100 per fase nel registro, tutte nell'output del comando)`);
 }
 
 title('Ultime run complete sul codice corrente');
@@ -175,13 +191,22 @@ if (historyView) {
 
 	title('Ultimi fallimenti');
 	for (const { run, result, screenshot } of report.failures.slice(-10)) {
-		console.log(`${when(result.time)} ${run.suite} · ${result.test}  [${code(run.info)}]`);
+		console.log(`${when(result.time)} ${run.suite} · ${result.fullName ?? result.test}${result.kind === 'container' ? ' [suite]' : ''}${result.propagated ? ' [fallimento propagato]' : ''}  [${code(run.info)}]`);
 		console.log(`    ${firstLine(result.error)}`);
 		if (result.expected !== undefined) console.log(`    atteso ${String(result.expected).slice(0, 120)}  ottenuto ${String(result.actual).slice(0, 120)}`);
 		if (result.frames?.length) console.log(`    dove: ${result.frames.slice(0, 4).join(' ← ')}`);
 		if (screenshot) console.log(screenshot.missing ? `    schermata non disponibile: ${screenshot.reason}` : `    schermata: ${screenshot.path}`);
 	}
 	none(report.failures);
+}
+
+const diagnosticRuns = report.runs.filter(run => run.diagnostics.length && (historyView || (run.comparability === 'current' && run.status === 'fallita')));
+if (diagnosticRuns.length) {
+	title('Diagnostiche native del runtime (non sono esiti di test)');
+	for (const run of diagnosticRuns) for (const entry of run.diagnostics) {
+		console.log(`${when(entry.time)} ${run.suite} [${code(run.info)}]${entry.test ? ` · ${entry.test}` : ''}: ${entry.message}`);
+		if (entry.declaration) console.log(`    dove: ${entry.declaration.file}${entry.declaration.line ? `:${entry.declaration.line}:${entry.declaration.column ?? 0}` : ''}`);
+	}
 }
 
 // --- Manual observations, coverage and automatic external checks ------------
@@ -220,8 +245,16 @@ if (report.coverage.length && !only) {
 if (report.checks.length) {
 	title('Controlli automatici Windows');
 	for (const { run, check } of report.checks.slice(historyView ? -10 : -5)) {
-		console.log(`${check.ok ? '✔' : '✖'} ${when(check.time).padEnd(11)} ${check.name}  [${code(run.info)}]${check.plugin ? ` plugin ${check.plugin}` : ''}`);
+		// Warnings never fail a check, but a pass with warnings is not a clean pass:
+		// counted by the check itself, or from its console lines in older records.
+		const warnings = check.warnings ?? (check.console ?? []).filter(line => line.startsWith('[warn]')).length;
+		const label = check.ok && warnings ? `  superato con ${warnings} avvisi da revisionare` : '';
+		console.log(`${check.ok ? (warnings ? '⚠' : '✔') : '✖'} ${when(check.time).padEnd(11)} ${check.name}  [${code(run.info)}]${check.plugin ? ` plugin ${check.plugin}` : ''}${label}`);
+		if (!historyView && !check.ok && check.problems?.length) console.log(`    problema: ${check.problems[0]}${check.problems.length > 1 ? ` (e altri ${check.problems.length - 1})` : ''}`);
 		if (historyView) {
+			// Each channel on its own: the same console call is usually seen by more than one.
+			for (const [channel, counts] of Object.entries(check.channels ?? {})) console.log(`    ${channel}: ${counts.errors} errori, ${counts.warnings} avvisi`);
+			if (check.collection && !check.collection.complete) console.log('    raccolta incompleta');
 			for (const problem of check.problems ?? []) console.log(`    problema: ${problem}`);
 			for (const [name, ok] of Object.entries(check.results ?? {})) if (ok !== true) console.log(`    ${name}: ${JSON.stringify(ok)}`);
 			for (const line of (check.console ?? []).slice(0, 3)) console.log(`    console ${line}`);

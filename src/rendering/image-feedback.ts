@@ -1,9 +1,9 @@
 import { pressedImages, imageFeedbackRefresh } from './image-gesture';
 import { ViewPlugin, type EditorView, type ViewUpdate } from '@codemirror/view';
-import { editorLivePreviewField } from 'obsidian';
+import { Component, editorLivePreviewField } from 'obsidian';
 import { parseDocument } from '../markdown/model';
 import { imageAtElement } from './drag-target';
-import { windowOf } from './preview-dom';
+import { eventElement, windowOf } from './preview-dom';
 import { wrapModelField } from './wrap-state';
 
 // Refresh after native embeds or region widgets finish rendering. Only child
@@ -12,8 +12,19 @@ export const imageFeedback = ViewPlugin.fromClass(class {
 	private observer: MutationObserver;
 	private frame: number | undefined;
 	private win: Window;
+	// The drawn region whose image is under the pointer: its own outline gives
+	// way to the image's (styles.css). Tracked from the pointer's events on this
+	// editor's content, so in the window that shows it. Native listeners, not
+	// CodeMirror's handlers: those never receive the events a widget ignores
+	// (its bar and resize handles), and leaving an image for them must clear
+	// the mark.
+	private hovered: HTMLElement | undefined;
+	private lifecycle = new Component();
 	constructor(private view: EditorView) {
 		this.win = view.dom.win;
+		this.lifecycle.load();
+		this.lifecycle.registerDomEvent(view.contentDOM, 'mouseover', event => this.hover(eventElement(event)));
+		this.lifecycle.registerDomEvent(view.contentDOM, 'mouseout', event => this.leave(event.relatedTarget));
 		imageFeedbackRefresh.set(view, () => this.schedule());
 		this.observer = new (windowOf(view.dom).MutationObserver)(() => this.schedule());
 		this.observer.observe(view.contentDOM, { childList: true, subtree: true });
@@ -42,7 +53,21 @@ export const imageFeedback = ViewPlugin.fromClass(class {
 		if (update.docChanged || update.selectionSet ||
 			update.state.field(editorLivePreviewField, false) !== update.startState.field(editorLivePreviewField, false)) this.schedule();
 	}
+	hover(element: HTMLElement | null) {
+		const region = element?.tagName === 'IMG' ? element.closest<HTMLElement>('.iw-preview') : null;
+		if (region === this.hovered) return;
+		this.hovered?.classList.remove('iw-image-hover');
+		region?.classList.add('iw-image-hover');
+		this.hovered = region ?? undefined;
+	}
+	// Leaving the content: none of its elements is under the pointer any more.
+	// A mouse event's related target is an element or null, of any window.
+	leave(next: EventTarget | null) {
+		if (!this.view.contentDOM.contains(next as Node | null)) this.hover(null);
+	}
 	destroy() {
+		this.lifecycle.unload();
+		this.hover(null);
 		imageFeedbackRefresh.delete(this.view);
 		this.observer.disconnect();
 		if (this.frame !== undefined) this.win.cancelAnimationFrame(this.frame);

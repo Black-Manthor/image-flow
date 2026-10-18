@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { build } from 'esbuild';
 import { chromium } from '@playwright/test';
 import { inlineMap, savePageCoverage, startPageCoverage } from './copertura-mappa.mjs';
-import { mkdir } from 'node:fs/promises';
-import { ourFrames, record, sourceMapper } from './registro.mjs';
+import { record, sourceMapper } from './registro.mjs';
+import { failureScreenshot, watchPage } from './pagina-segnalazioni.mjs';
 
 const { outputFiles } = await build({ entryPoints: ['tests/browser-fixture.ts'], bundle: true, write: false, format: 'iife',
 	// A map back to the sources: the errors in the registry, and the coverage.
@@ -25,50 +25,38 @@ record({ kind: 'environment', chromium: browser.version(), build: 'fixture' });
 // A failed test's page, kept (never overwritten) and named in the registry.
 const failures = join('.obsidian-test', 'screenshots', 'chromium', 'fallimenti');
 let pages = 0;
+// Each test's page has its number in the registry (`page`).
+let opened = 0;
 const run = async (name, action, delayedCSS = false, options = {}) => test(name, options, async () => {
 	const page = await browser.newPage({ viewport: { width: 900, height: 1000 } });
 	await startPageCoverage(page);
-	// An error in the page fails the test, thrown or only logged: CodeMirror
-	// logs (console.error) what an extension throws, and goes on. Warnings are
-	// recorded. Each with where it comes from, in src/ or tests/.
-	const errors = [];
-	const note = (level, text, stack, where = '') => {
-		const frames = ourFrames(stack, bundles);
-		if (level === 'error') errors.push(`${text}${frames.length ? ` (${frames.join(' ← ')})` : ''}`);
-		record({ kind: 'console', level, source: frames[0]?.startsWith('src/') ? 'plugin' : 'pagina', test: name, text, where, ...(frames.length ? { frames } : {}) });
-	};
-	page.on('pageerror', error => note('error', error.message, error.stack));
-	page.on('console', message => {
-		const level = message.type();
-		if (level !== 'error' && level !== 'warning') return;
-		const { url = '', lineNumber = 0, columnNumber = 0 } = message.location() ?? {};
-		// The text may hold a stack of its own (CodeMirror logs the error it caught): its frames first.
-		const [first, ...stack] = message.text().split('\n');
-		note(level, first, `${stack.join('\n')}\nat (${url}:${lineNumber + 1}:${columnNumber + 1})`, url);
-	});
+	// An error in the page fails the test, from any channel: logged (CodeMirror
+	// logs with console.error what an extension throws, and goes on), uncaught,
+	// or reaching only the window's `error` or `unhandledrejection` event (a
+	// ResizeObserver loop). Warnings are recorded. Each with where it comes
+	// from, in src/ or tests/, or uncertain (tests/pagina-segnalazioni.mjs).
+	const watch = await watchPage(page, { label: ++opened, bundles });
+	watch.test = name;
+	const errors = () => watch.errors.map(entry => `${entry.event ?? 'console'}: ${entry.text}${entry.frames.length ? ` (${entry.frames.join(' ← ')})` : ''}`);
 	try {
 		await page.setContent('<style>body{margin:30px;--text-muted:#666;--interactive-accent:#7655dd;--text-error:#c33;--background-primary:white;--text-normal:#222}#editor{width:600px}p{margin:0 0 16px}</style><div id="editor"></div>');
+		// setContent replaced the document, and its window's listeners with it.
+		await watch.arm();
 		if (!delayedCSS) await page.addStyleTag({ content: css });
 		await page.addScriptTag({ content: code });
 		// The code failed while loading (thrown at import): nothing will be drawn, say why now.
-		if (errors.length) throw new Error(`the page did not load: ${errors.join('; ')}`);
+		if (errors().length) throw new Error(`the page did not load: ${errors().join('; ')}`);
 		await page.locator('.iw-preview img').waitFor();
 		await action(page);
 		await page.evaluate(() => window.fixture.destroy());
 		assert.equal(await page.evaluate(() => window.fixture.counts().components), 0);
-		assert.deepEqual(errors, []);
+		assert.deepEqual(errors(), []);
 	} catch (error) {
-		const path = join(failures, `${new Date().toISOString().replace(/[:.]/g, '-')}-${name.replace(/[^\p{L}\p{N}]+/gu, '-').slice(0, 80)}.png`);
-		try {
-			await mkdir(failures, { recursive: true });
-			await page.screenshot({ path });
-			record({ kind: 'screenshot', test: name, path });
-		} catch (failure) {
-			record({ kind: 'screenshot', test: name, missing: true, reason: String(failure?.message ?? failure).split('\n')[0] });
-		}
+		await failureScreenshot(page, name, failures);
 		throw error;
 	} finally {
 		await savePageCoverage(page, `browser-${++pages}`, code, process.cwd(), entry => entry.source === code);
+		await watch.stop();
 		await page.close();
 	}
 });
@@ -127,6 +115,14 @@ try {
 		assert.equal(await page.locator('.iw-preview[data-kept]').count(), 0, 'nothing kept from the other note');
 		assert.equal(await page.evaluate(() => window.fixture.counts().renders), renders + 2);
 	});
+	await run('Reading editor changes target one note, typing keeps its layout, closed sections and unload stop retries', async page => {
+		const result = await page.evaluate(() => window.fixture.readingEditorEvents());
+		assert.ok(result.targeted.a > 0 && result.targeted.right, JSON.stringify(result));
+		assert.equal(result.targeted.b, 0, 'unrelated note is not read');
+		assert.deepEqual(result.typing, { mutations: 0, b: 0 });
+		assert.equal(result.closed, true);
+		assert.equal(result.unloaded, true);
+	});
 	await run('Reading reused paragraph updates comment and clears layout when no longer a row', async page => {
 		const source = 'Prima.\n\n![[a.png|100]] %%iw-row align=right%%\n\nDopo.';
 		await page.evaluate(source => window.fixture.runReadingSection(source, 2, [{ width: 100, src: 'a.png' }]), source);
@@ -138,24 +134,34 @@ try {
 		assert.equal(await p.evaluate(el => el.classList.contains('iw-row')), false);
 		assert.equal(await p.locator('.image-embed').evaluate(el => el.style.getPropertyValue('--iw-row-width')), '');
 	});
-	await run('Reading: a section shown again whose source changed silently is redrawn before its first frame; unchanged, it is not; the timers then find it current', async page => {
-		// Observations of the sections (ResizeObserver): connected and disconnected, per element.
+	// Reading sections shown again: the plugin's observations of
+	// the sections are counted, and what the first frame that shows a section
+	// paints is read without an observer of the test's own, which could change
+	// or hide what the plugin's observer does: the frame that shows it lays it
+	// out, runs the plugin's observer and paints; the next frame's first
+	// animation callback reads what was painted. A ResizeObserver loop reported
+	// by the page fails the test (tests/pagina-segnalazioni.mjs).
+	const readingVisibility = async page => {
 		await page.evaluate(() => {
 			window.observed = new Map();
 			const { observe, unobserve } = ResizeObserver.prototype;
 			const count = (target, key) => { if (!target.matches?.('.iw-reading-test, .iw-reading-note > div')) return; const entry = window.observed.get(target) ?? { observe: 0, unobserve: 0 }; entry[key]++; window.observed.set(target, entry); };
-			ResizeObserver.prototype.observe = function (target, options) { if (!this.test) count(target, 'observe'); return observe.call(this, target, options); };
-			ResizeObserver.prototype.unobserve = function (target) { if (!this.test) count(target, 'unobserve'); return unobserve.call(this, target); };
+			ResizeObserver.prototype.observe = function (target, options) { count(target, 'observe'); return observe.call(this, target, options); };
+			ResizeObserver.prototype.unobserve = function (target) { count(target, 'unobserve'); return unobserve.call(this, target); };
 		});
 		const frames = n => page.evaluate(n => new Promise(resolve => { const step = left => left ? requestAnimationFrame(() => step(left - 1)) : resolve(); step(n); }), n);
-		// What the frame that shows `selector` again lays out, read after the plugin's own observer (created before), before paint.
 		const shownWith = (selector, read) => page.evaluate(([selector, read]) => new Promise(resolve => {
 			const target = document.querySelector(selector);
-			const observer = new ResizeObserver(entries => { if (entries.at(-1).contentRect.width > 0) { observer.disconnect(); resolve(eval(`(${read})`)(target)); } });
-			observer.test = true;
 			target.style.display = '';
-			observer.observe(target);
+			requestAnimationFrame(() => requestAnimationFrame(() => resolve(eval(`(${read})`)(target))));
 		}), [selector, read.toString()]);
+		const hide = async selector => { await page.evaluate(selector => { document.querySelector(selector).style.display = 'none'; }, selector); await frames(2); };
+		const observed = selector => page.evaluate(selector => window.observed.get(document.querySelector(selector)), selector);
+		return { frames, shownWith, hide, observed };
+	};
+
+	await run('Reading, row: a section shown again whose source changed silently has its new layout in the first frame, without a ResizeObserver loop; unchanged, it is not processed; the timers then find it current; repeated and closed cleanly', async page => {
+		const { frames, shownWith, hide, observed } = await readingVisibility(page);
 		// Class changes on the row's paragraph: the section processed again.
 		const reprocessed = async action => {
 			await page.evaluate(() => { window.changes = 0; window.watch = new MutationObserver(list => { window.changes += list.length; }); window.watch.observe(document.querySelector('.iw-reading-test p'), { attributes: true, attributeFilter: ['class', 'style'] }); });
@@ -163,39 +169,66 @@ try {
 			await frames(3);
 			return page.evaluate(() => { window.watch.disconnect(); return window.changes; });
 		};
-
-		// A. A row, its comment changed while the section was hidden: the first frame that shows it has the new gap.
 		const row = 'Prima.\n\n![[a.png|100]] ![[b.png|140]] %%iw-row gap=8%%\n\nDopo.';
+		const withGap = gap => row.replace('gap=8', `gap=${gap}`);
 		await page.evaluate(source => window.fixture.runReadingSection(source, 2, [{ width: 100, src: 'a.png' }, { width: 140, src: 'b.png' }]), row);
 		const gap = () => page.evaluate(() => document.querySelector('.iw-reading-test p').style.getPropertyValue('--iw-row-gap'));
 		assert.equal(await gap(), `${8 / 700 * 100}%`);
-		await page.evaluate(() => { document.querySelector('.iw-reading-test').style.display = 'none'; });
 		await frames(2);
-		await page.evaluate(source => window.fixture.changeReadingSourceQuietly(source.replace('gap=8', 'gap=24')), row);
+		assert.deepEqual(await observed('.iw-reading-test'), { observe: 1, unobserve: 0 }, 'observed once, from the frame after its processing');
+		// A. Its comment changed while hidden: the first frame that shows it has the new gap.
+		await hide('.iw-reading-test');
+		await page.evaluate(source => window.fixture.changeReadingSourceQuietly(source), withGap(24));
 		assert.equal(await shownWith('.iw-reading-test', section => section.querySelector('p').style.getPropertyValue('--iw-row-gap')), `${24 / 700 * 100}%`, 'A: the new gap in the first frame that shows it');
 		// D. The timers after it find the section current: not processed again.
-		assert.equal(await reprocessed(() => page.evaluate(source => window.fixture.setReadingSource(source.replace('gap=8', 'gap=24')), row)), 0, 'D: no second processing');
+		assert.equal(await reprocessed(() => page.evaluate(source => window.fixture.setReadingSource(source), withGap(24))), 0, 'D: no second processing');
 		// F. Processed again, its old observation went with its old processing: one left.
-		assert.deepEqual(await page.evaluate(() => window.observed.get(document.querySelector('.iw-reading-test'))), { observe: 2, unobserve: 1 }, 'F: one observation of the section');
+		assert.deepEqual(await observed('.iw-reading-test'), { observe: 2, unobserve: 1 }, 'F: one observation of the section');
 		// C. Hidden and shown again, unchanged: nothing processed again.
 		assert.equal(await reprocessed(async () => {
-			await page.evaluate(() => { document.querySelector('.iw-reading-test').style.display = 'none'; });
-			await frames(2);
+			await hide('.iw-reading-test');
 			await page.evaluate(() => { document.querySelector('.iw-reading-test').style.display = ''; });
 		}), 0, 'C: no processing for an unchanged section');
 		// E. Shown all along: a change is caught by the timers as before.
-		await page.evaluate(source => window.fixture.setReadingSource(source.replace('gap=8', 'gap=40')), row);
+		await page.evaluate(source => window.fixture.setReadingSource(source), withGap(40));
 		assert.equal(await gap(), `${40 / 700 * 100}%`, 'E: caught while shown');
+		await frames(2);
+		// G. Again and again: each time the new gap in the first frame, one observation left.
+		const before = await observed('.iw-reading-test');
+		for (const next of [48, 56, 64]) {
+			await hide('.iw-reading-test');
+			await page.evaluate(source => window.fixture.changeReadingSourceQuietly(source), withGap(next));
+			assert.equal(await shownWith('.iw-reading-test', section => section.querySelector('p').style.getPropertyValue('--iw-row-gap')), `${next / 700 * 100}%`, `G: gap ${next} in the first frame`);
+			await frames(2);
+		}
+		assert.deepEqual(await observed('.iw-reading-test'), { observe: before.observe + 3, unobserve: before.unobserve + 3 }, 'G: one observation left after each processing');
+		// H. Processed again and closed in the same task, before the next frame: no
+		// observation is left (none started late), and nothing more is done.
+		await page.evaluate(source => { window.fixture.setReadingSource(source); window.fixture.unloadReadingSection(); }, withGap(72));
+		await frames(3);
+		const closed = await observed('.iw-reading-test');
+		assert.ok(closed.unobserve >= closed.observe, `H: no observation left after the section closed: ${JSON.stringify(closed)}`);
+		assert.equal(await reprocessed(async () => {
+			await hide('.iw-reading-test');
+			await page.evaluate(source => window.fixture.changeReadingSourceQuietly(source), withGap(80));
+			await page.evaluate(() => { document.querySelector('.iw-reading-test').style.display = ''; });
+		}), 0, 'H: a closed section is not processed again');
+	});
 
-		// B. A wrap whose side changed while hidden: the first frame that shows it has it on the new side.
+	await run('Reading, wrap: a wrap shown again whose side changed silently is on its new side in the first frame, without a ResizeObserver loop, again and again', async page => {
+		const { frames, shownWith, hide } = await readingVisibility(page);
 		const wrap = 'Prima.\n\n[wrap:start] %%iw-wrap side=left%%\n\n![[foto.png|100]]\n\nTesto.\n\n[wrap:end]\n\nDopo.';
 		await page.evaluate(source => window.fixture.runReadingNote(source), wrap);
 		assert.equal(await page.evaluate(() => document.querySelector('.iw-reading-note .iw-reading-wrap').classList.contains('iw-layout-iw-left')), true);
-		await page.evaluate(() => { document.querySelector('.iw-reading-note').style.display = 'none'; });
 		await frames(2);
-		await page.evaluate(source => window.fixture.changeReadingSourceQuietly(source.replace('side=left', 'side=right')), wrap);
-		assert.deepEqual(await shownWith('.iw-reading-note', note => Array.from(note.querySelectorAll('.iw-reading-wrap')).map(wrap => wrap.className.match(/iw-layout-iw-\w+/)[0])),
-			['iw-layout-iw-right'], 'B: on its new side in the first frame that shows it, and only one');
+		// B. Its side changed while hidden, back and forth: the first frame that shows it has it on the new side, and only one.
+		for (const side of ['right', 'left', 'right']) {
+			await hide('.iw-reading-note');
+			await page.evaluate(source => window.fixture.changeReadingSourceQuietly(source), wrap.replace('side=left', `side=${side}`));
+			assert.deepEqual(await shownWith('.iw-reading-note', note => Array.from(note.querySelectorAll('.iw-reading-wrap')).map(wrap => wrap.className.match(/iw-layout-iw-\w+/)[0])),
+				[`iw-layout-iw-${side}`], `B: on its new side (${side}) in the first frame that shows it, and only one`);
+			await frames(2);
+		}
 	});
 
 	await run('Reading leaves a row whose images are not all drawn as Obsidian drew it', async page => {
@@ -381,7 +414,7 @@ try {
 			await select(page, text.indexOf('Primo'));
 			await select(page, 0);
 		}
-		assert.equal(await page.evaluate(() => window.fixture.counts().components), 4); // plugin, interaction, image drag, preview
+		assert.equal(await page.evaluate(() => window.fixture.counts().components), 5); // plugin, interaction, image drag, image feedback, preview
 	});
 	await run('late asynchronous renders cannot resurrect a preview after editing starts', async page => {
 		const text = await page.evaluate(() => window.fixture.text);
@@ -391,7 +424,7 @@ try {
 		await select(page, text.indexOf('Secondo'));
 		await page.waitForTimeout(150);
 		assert.equal(await page.locator('.iw-preview').count(), 0);
-		assert.equal(await page.evaluate(() => window.fixture.counts().components), 3);
+		assert.equal(await page.evaluate(() => window.fixture.counts().components), 4); // plugin, interaction, image drag, image feedback
 	});
 	await run('a render failure leaves readable Markdown and a working route into editing', async page => {
 		const text = await page.evaluate(() => window.fixture.text);
@@ -1637,12 +1670,76 @@ try {
 			await img.hover();
 			assert.equal(await region.evaluate(el => getComputedStyle(el).outlineStyle), 'none');
 			assert.equal(await img.evaluate(el => getComputedStyle(el).outlineStyle), 'solid');
+			// Back from the image to the region: the region's outline returns.
+			await page.mouse.move(before.x + before.width - 3, before.y + 4);
+			assert.equal(await region.evaluate(el => getComputedStyle(el).outlineStyle), 'solid');
+			// From the image to its resize handle (CodeMirror ignores the handle's
+			// events): the image is no longer under the pointer, the region's
+			// outline returns, as in 0.1.2; back on the image it goes again.
+			await img.hover();
+			const handle = await region.locator(kind === 'row' ? '.iw-row-handle' : '.iw-wrap-handle').first().boundingBox();
+			await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+			assert.equal(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.className, { x: handle.x + handle.width / 2, y: handle.y + handle.height / 2 }),
+				kind === 'row' ? 'iw-row-handle' : 'iw-wrap-handle');
+			assert.equal(await region.evaluate(el => getComputedStyle(el).outlineStyle), 'solid', 'on the handle: the region outline');
+			assert.equal(await page.locator('.iw-image-hover').count(), 0);
+			await img.hover();
+			assert.equal(await region.evaluate(el => getComputedStyle(el).outlineStyle), 'none');
 			await page.mouse.move(5, 5);
 			assert.equal(await region.evaluate(el => getComputedStyle(el).outlineStyle), 'none');
+			assert.equal(await page.locator('.iw-image-hover').count(), 0, 'no region stays marked once the pointer left');
 			const source = await page.evaluate(() => window.fixture.doc());
 			await region.click({ position: { x: before.width - 3, y: 4 } });
 			assert.equal(await region.count(), 0);
 			assert.equal(await page.evaluate(() => window.fixture.doc()), source);
+		});
+	}
+
+	await run('a wrap drawn again under a still pointer: its image keeps the outline, the new region none', async page => {
+		const frames = n => page.evaluate(n => new Promise(resolve => { const step = left => left ? requestAnimationFrame(() => step(left - 1)) : resolve(); step(n); }), n);
+		const region = page.locator('.iw-preview');
+		const img = region.locator('img').first();
+		await img.waitFor();
+		await img.hover();
+		await page.evaluate(() => { document.querySelector('.iw-preview').dataset.before = '1'; });
+		assert.equal(await page.locator('.iw-preview.iw-image-hover').count(), 1);
+		// Its text changes, the pointer does not move: the wrap is drawn anew
+		// (a new root), with its image where it was.
+		const at = await page.evaluate(() => window.fixture.doc().indexOf('Primo paragrafo.'));
+		await page.evaluate(at => window.fixture.edit(at, at + 'Primo paragrafo.'.length, 'Primo paragrafo cambiato.'), at);
+		await frames(4);
+		assert.equal(await page.locator('.iw-preview[data-before]').count(), 0, 'a new root');
+		assert.equal(await img.evaluate(el => getComputedStyle(el).outlineStyle), 'solid', 'the image under the pointer keeps its outline');
+		assert.equal(await region.evaluate(el => getComputedStyle(el).outlineStyle), 'none', 'the new region draws none');
+		assert.equal(await page.locator('.iw-preview.iw-image-hover').count(), 1);
+		await page.mouse.move(5, 5);
+		assert.equal(await page.locator('.iw-image-hover').count(), 0);
+	});
+
+	for (const kind of ['wrap', 'row']) {
+		await run(`${kind}: its line takes no height beside the widget, and is an ordinary line again in the source`, async page => {
+			if (kind === 'row') await page.evaluate(() => window.fixture.setDoc('Prima.\n\n![[a.png|100]] ![[b.png|140]]\n\nDopo.'));
+			const frames = n => page.evaluate(n => new Promise(resolve => { const step = left => left ? requestAnimationFrame(() => step(left - 1)) : resolve(); step(n); }), n);
+			const region = page.locator('.iw-preview');
+			await region.locator('img').first().waitFor();
+			const line = () => page.evaluate(() => {
+				const widget = document.querySelector('.iw-preview');
+				const element = widget?.closest('.cm-line');
+				if (!widget || !element) return undefined;
+				return { marked: element.classList.contains('iw-preview-line'), line: Math.round(element.getBoundingClientRect().height),
+					widget: Math.round(widget.getBoundingClientRect().height),
+					others: [...element.children].filter(child => child !== widget).map(child => `${child.className}:${Math.round(child.getBoundingClientRect().height)}`) };
+			});
+			const drawn = await line();
+			assert.ok(drawn?.marked, 'the line of the widget is marked');
+			assert.ok(drawn.others.length > 0, `CodeMirror's caret buffers are beside the widget (${JSON.stringify(drawn)})`);
+			assert.ok(drawn.others.every(other => other.endsWith(':0')), `nothing beside the widget takes height (${drawn.others.join(', ')})`);
+			assert.ok(Math.abs(drawn.line - drawn.widget) <= 1, `the line is as tall as its widget (${drawn.line} / ${drawn.widget})`);
+			const at = await page.evaluate(() => window.fixture.doc().indexOf(window.fixture.doc().includes('[wrap:start]') ? '[wrap:start]' : '![['));
+			await page.evaluate(position => window.fixture.select(position + 2), at);
+			await frames(2);
+			assert.equal(await region.count(), 0, 'the source is shown');
+			assert.equal(await page.locator('.cm-line.iw-preview-line').count(), 0, 'no line keeps the mark');
 		});
 	}
 
@@ -1740,16 +1837,17 @@ try {
 		// A. Drawn, its height reported on its line; its drawing marked.
 		await page.waitForFunction(() => {
 			const root = document.querySelector('.iw-row-preview');
-			return root?.querySelector('p.iw-row') && root.closest('.cm-line')?.getAttribute('data-iw-row-height') === String(Math.round(root.getBoundingClientRect().height));
+			// The real height, not rounded; within half of Chromium's 1/64 px layout unit.
+			return root?.querySelector('p.iw-row') && Math.abs(Number(root.closest('.cm-line')?.getAttribute('data-iw-row-height')) - root.getBoundingClientRect().height) < 1 / 128;
 		});
 		await frames(3);
 		const state = () => page.evaluate(() => {
 			const root = document.querySelector('.iw-row-preview');
-			return { kept: Boolean(root?.dataset.kept), reports: window.fixture.rowHeights(), attribute: root?.closest('.cm-line')?.getAttribute('data-iw-row-height'), height: String(Math.round(root.getBoundingClientRect().height)) };
+			return { kept: Boolean(root?.dataset.kept), reports: window.fixture.rowHeights(), attribute: Number(root?.closest('.cm-line')?.getAttribute('data-iw-row-height')), height: root.getBoundingClientRect().height };
 		});
 		await page.evaluate(() => { document.querySelector('.iw-row-preview').dataset.kept = '1'; });
 		const drawn = await state();
-		assert.equal(drawn.attribute, drawn.height, 'A: its real height reported');
+		assert.ok(Math.abs(drawn.attribute - drawn.height) < 1 / 128, `A: its real height reported (${drawn.attribute} for ${drawn.height})`);
 		const editor = (property, value) => page.evaluate(([property, value]) => { document.querySelector('#editor').style[property] = value; }, [property, value]);
 		// As in the move to another window: the row's line with no width, its padding left (0×8).
 		const noWidth = on => page.evaluate(on => {
@@ -1759,7 +1857,7 @@ try {
 		for (const [label, hide, show] of [['B, editor hidden', () => editor('display', 'none'), () => editor('display', '')], ['C, no width', () => noWidth(true), () => noWidth(false)]]) {
 			await hide();
 			await frames(4);
-			const away = await page.evaluate(() => ({ reports: window.fixture.rowHeights(), attribute: document.querySelector('.iw-row-preview')?.closest('.cm-line')?.getAttribute('data-iw-row-height'),
+			const away = await page.evaluate(() => ({ reports: window.fixture.rowHeights(), attribute: Number(document.querySelector('.iw-row-preview')?.closest('.cm-line')?.getAttribute('data-iw-row-height')),
 				box: (({ width, height }) => `${Math.round(width)}x${Math.round(height)}`)(document.querySelector('.iw-row-preview').getBoundingClientRect()) }));
 			assert.equal(away.reports, drawn.reports, `${label}: no height reported (${away.box})`);
 			assert.equal(away.attribute, drawn.attribute, `${label}: the last real height kept`);
@@ -1773,8 +1871,8 @@ try {
 		await page.waitForFunction(before => window.fixture.rowHeights() > before, drawn.reports);
 		await frames(3);
 		const narrow = await state();
-		assert.notEqual(narrow.height, drawn.height, 'D: a new height');
-		assert.equal(narrow.attribute, narrow.height, 'D: the new height reported');
+		assert.ok(Math.abs(narrow.height - drawn.height) >= 1 / 64, 'D: a new height');
+		assert.ok(Math.abs(narrow.attribute - narrow.height) < 1 / 128, `D: the new height reported (${narrow.attribute} for ${narrow.height})`);
 		await editor('width', '');
 	});
 
@@ -1825,11 +1923,22 @@ try {
 				// Remove callback annotations and read synchronously, before observers can restore them.
 				const embed = root.querySelector('.image-embed');
 				embed.classList.remove('iw-left', 'iw-right');
-				for (const p of root.querySelectorAll('p')) p.classList.remove('iw-image-paragraph', 'iw-first-paragraph');
-				return { float: getComputedStyle(embed).cssFloat, paragraph: getComputedStyle(embed.parentElement).display };
+				for (const block of root.querySelectorAll('p, .iw-image-carrier')) block.classList.remove('iw-image-paragraph', 'iw-first-paragraph');
+				const carrier = embed.parentElement;
+    // The native paragraph, as before the carrier: the float rules hold for it.
+    const native = document.createElement('p');
+    carrier.replaceWith(native);
+    native.append(...carrier.childNodes);
+    const transientFloat = getComputedStyle(embed).cssFloat;
+    native.replaceWith(carrier);
+    carrier.append(...native.childNodes);
+    return { float: getComputedStyle(embed).cssFloat, transientFloat,
+     paragraph: getComputedStyle(carrier).display, carrier: carrier.matches('div.iw-image-carrier') };
 			});
 			assert.equal(result.float, side);
-			assert.equal(result.paragraph, 'contents');
+   assert.equal(result.transientFloat, side);
+			assert.equal(result.paragraph, 'block');
+			assert.equal(result.carrier, true);
 		});
 	}
 	await run('export: wrap layout is applied and markers are removed from the printed output', async page => {

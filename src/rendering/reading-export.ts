@@ -1,6 +1,6 @@
 import type { Plugin } from 'obsidian';
 import { START, END, compactWraps, markerKind, markerOnOwnParagraph, parseDocument, imageClass, type DocumentModel } from '../markdown/model';
-import { imageEmbeds, flattenImageParagraph, firstParagraph } from './image-layout';
+import { imageEmbeds, ensureImageCarrier, firstParagraph } from './image-layout';
 import { rowDefaults, type ImageSettings } from '../settings';
 import { alignBlocks, sourceBlocks, type SectionRange } from '../markdown/blocks';
 import { embedPaths, kindOf } from './block-kinds';
@@ -107,9 +107,12 @@ export async function applyExportLayout(element: HTMLElement, plugin: Plugin, so
 			const embed = embeds[index];
 			if (!cls || !embed) return;
 			embed.classList.add(cls);
-			const paragraph = flattenImageParagraph(embed, (target, name) => target.classList.add(name));
+			const wrapperIndex = body.findIndex(node => node === embed || node.contains(embed));
+			const paragraph = ensureImageCarrier(embed, (target, name) => target.classList.add(name));
+			// An embedded note's blocks are bare: the carrier is itself a block of
+			// the wrap, and the block after it starts beside the image (styles.css).
+			if (paragraph?.classList.contains('iw-export-block')) body[wrapperIndex + 1]?.classList.add('iw-export-after-carrier');
 			if (paragraph) {
-				const wrapperIndex = body.findIndex(node => node.contains(paragraph));
 				const next = body[wrapperIndex + 1] ? firstParagraph(body[wrapperIndex + 1]!) : null;
 				if (next && next !== paragraph) next.classList.add('iw-first-paragraph');
 			}

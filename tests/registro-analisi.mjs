@@ -103,7 +103,7 @@ export function analyze(entries, { now = Date.now(), state, content, only } = {}
 		const id = entry.run ?? `senza-esecuzione-${entry.time.slice(0, 13)}`;
 		let run = runs.get(id);
 		if (!run) runs.set(id, run = { id, time: entry.time, last: entry.time, suite: entry.suite ?? 'app', info: undefined, environment: undefined,
-			results: [], console: [], screenshots: [], checks: [], manualChecks: [], commands: [], coverage: undefined, end: undefined });
+			results: [], containers: [], collections: [], diagnostics: [], console: [], screenshots: [], checks: [], manualChecks: [], commands: [], coverage: undefined, end: undefined });
 		if (entry.time > run.last) run.last = entry.time;
 		return run;
 	};
@@ -112,6 +112,9 @@ export function analyze(entries, { now = Date.now(), state, content, only } = {}
 		if (entry.kind === 'run') { run.info = entry; run.time = entry.time; run.suite = entry.suite; }
 		else if (entry.kind === 'environment' || entry.kind === 'app') run.environment = { ...run.environment, ...entry };
 		else if (entry.kind === 'result') run.results.push(entry);
+		else if (entry.kind === 'container') run.containers.push(entry);
+		else if (entry.kind === 'collection') run.collections.push(entry);
+		else if (entry.kind === 'diagnostic') run.diagnostics.push(entry);
 		else if (entry.kind === 'console') run.console.push(entry);
 		else if (entry.kind === 'screenshot') run.screenshots.push(entry);
 		else if (entry.kind === 'check') run.checks.push(entry);
@@ -146,7 +149,7 @@ export function analyze(entries, { now = Date.now(), state, content, only } = {}
 		else if (run.completion !== 'completed') run.scope = 'unknown';
 		else if (!run.resultCount) run.scope = 'empty';
 		else if (run.filtered) run.scope = 'filtered';
-		else if (!run.totalsConsistent) run.scope = 'partial';
+		else if (!run.totalsConsistent || run.end?.consoleNode?.incomplete || run.collections.some(entry => entry.incomplete)) run.scope = 'partial';
 		else run.scope = 'full';
 		run.environmentKey = environmentOf(run);
 		run.historyEnvironmentKey = historyEnvironmentOf(run);
@@ -160,9 +163,11 @@ export function analyze(entries, { now = Date.now(), state, content, only } = {}
 		else if (run.completion === 'running') run.status = 'in corso';
 		else if (run.checks.length) run.status = run.checks.every(check => check.ok) ? 'superata' : 'fallita';
 		else if (run.manualChecks.length) run.status = run.manualChecks.at(-1).problem ? 'non determinabile' : run.manualChecks.at(-1).status;
-		else if (run.commands.length) run.status = run.commands.at(-1).ok ? 'superata' : 'fallita';
+		// Exit 0 with something on the command's watched stderr (lint:css with
+		// warnings) passes with reports, never cleanly.
+		else if (run.commands.length) run.status = !run.commands.at(-1).ok ? 'fallita' : run.commands.at(-1).reported ? 'superata con segnalazioni' : 'superata';
 		else if (run.coverage) run.status = run.coverage.failedSuites?.length ? 'fallita' : 'superata';
-		else if (failed || (run.end.fallito ?? 0) > 0) run.status = 'fallita';
+		else if (failed || (run.end.fallito ?? 0) > 0 || run.end.nativeSuccess === false || run.containers.some(item => item.result === 'fallito')) run.status = 'fallita';
 		else if (!run.results.length) run.status = 'fallita (nessun test eseguito)';
 		else run.status = 'superata';
 		run.conditions = conditionsOf(run);
@@ -174,8 +179,8 @@ export function analyze(entries, { now = Date.now(), state, content, only } = {}
 	// Results by test, and by test and conditions.
 	const byTest = new Map();
 	for (const run of ordered) for (const result of run.results) {
-		if (!matches(result.test) || result.result === 'saltato') continue;
-		const key = `${run.suite} · ${result.test}`;
+		if (!matches(result.fullName ?? result.test) || result.result === 'saltato') continue;
+		const key = `${run.suite} · ${result.fullName ?? result.test}`;
 		const list = byTest.get(key) ?? [];
 		list.push({ ...result, run });
 		byTest.set(key, list);
@@ -212,7 +217,7 @@ export function analyze(entries, { now = Date.now(), state, content, only } = {}
 	}
 	const brokenNow = latestCurrentResults.filter(item => item.result.result === 'fallito');
 
-	const failures = ordered.flatMap(run => run.results.filter(result => result.result === 'fallito' && matches(result.test))
+	const failures = ordered.flatMap(run => [...run.results, ...run.containers].filter(result => result.result === 'fallito' && matches(result.fullName ?? result.test))
 		.map(result => ({ run, result, screenshot: run.screenshots.find(entry => entry.test === result.test) })));
 
 	// Console messages by level, suite, source and first line (numbers made neutral).
@@ -236,7 +241,7 @@ export function analyze(entries, { now = Date.now(), state, content, only } = {}
 	for (const run of ordered) {
 		if (!codeKey(run.info) || !run.historyEnvironmentKey) continue;
 		const lastByTest = new Map();
-		for (const result of run.results) if (result.result === 'superato' || result.result === 'fallito') lastByTest.set(result.test, result);
+		for (const result of run.results) if (result.result === 'superato' || result.result === 'fallito') lastByTest.set(result.fullName ?? result.test, result);
 		for (const [test, result] of lastByTest) {
 			const key = `${run.suite} · ${test}`;
 			const historyKey = JSON.stringify([run.suite, test, run.historyEnvironmentKey]);

@@ -13,6 +13,8 @@ import { clickAnchor } from './click-anchor';
 import { remeasureEffect, selectionTouches, wrapModelField, wrapSnapshots, type WrapSnapshot } from './wrap-state';
 import { MarkerWidget, WrapWidget } from './wrap-widget';
 
+const previewLine = Decoration.line({ class: 'iw-preview-line' });
+
 // Row defaults live in the settings, outside the document: when they change,
 // every open editor recomputes its decorations without any edit or click.
 const refreshRowsEffect = StateEffect.define<null>();
@@ -53,10 +55,13 @@ export function createLivePreview(plugin: Plugin, getSettings: () => ImageSettin
 		const { snapshots, rows } = state.field(layoutField);
 		const sourcePath = state.field(editorInfoField, false)?.file?.path ?? '';
 		const ranges: Range<Decoration>[] = [];
+		// The line a widget is drawn on (styles.css flattens it around the widget).
+		const widgetLine = (from: number) => previewLine.range(state.doc.lineAt(from).from);
 		for (const snapshot of snapshots) {
 			if (!selectionTouches(state.selection, snapshot.from, snapshot.to)) {
 				ranges.push(Decoration.replace({ inclusive: false,
 					widget: new WrapWidget(snapshot, sourcePath, plugin, getSettings) }).range(snapshot.from, snapshot.to));
+				ranges.push(widgetLine(snapshot.from));
 			} else {
 				for (const [from, to] of [[snapshot.from, snapshot.startMarkerTo], [snapshot.endMarkerFrom, snapshot.to]] as const) {
 					ranges.push(Decoration.line({ class: 'iw-editing-boundary' }).range(from));
@@ -70,6 +75,7 @@ export function createLivePreview(plugin: Plugin, getSettings: () => ImageSettin
 			if (selectionTouches(state.selection, row.from, row.to)) continue;
 			ranges.push(Decoration.replace({ inclusive: false,
 				widget: new RowWidget(row, markdown, sourcePath, plugin, getSettings) }).range(row.from, row.to));
+			ranges.push(widgetLine(row.from));
 		}
 		return Decoration.set(ranges, true);
 	}

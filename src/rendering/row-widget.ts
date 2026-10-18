@@ -3,7 +3,7 @@ import { Component, MarkdownRenderer, type Plugin } from 'obsidian';
 import type { ImageRow } from '../markdown/row-model';
 import { annotateImagePosition, eventElement, previewStart, previewTargets, windowOf } from './preview-dom';
 import { watchRow } from './row-layout';
-import { knownRowHeight, rowHeightEffect } from './row-height';
+import { knownRowHeight, rowHeightEffect, rowHeightOf, sameRowHeight } from './row-height';
 import { createRowToolbar } from './row-toolbar';
 import { BLOCK_TOOLBAR_CLASS } from './block-toolbar';
 import { ROW_HANDLE_CLASS, ensureRowHandles, startRowResize } from './row-resize-handle';
@@ -77,8 +77,8 @@ export class RowWidget extends WidgetType {
 			// a height: reporting it changed the line's attribute, and coming back
 			// that redrew every row. The last real height stays reported.
 			if (start === undefined || box.width === 0) return;
-			const height = Math.round(box.height);
-			if (height === reported) return;
+			const height = rowHeightOf(root);
+			if (sameRowHeight(height, reported)) return;
 			reported = height;
 			view.dispatch({ effects: rowHeightEffect.of({ line: view.state.doc.lineAt(start).from, height }) });
 		};

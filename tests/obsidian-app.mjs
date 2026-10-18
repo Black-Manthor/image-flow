@@ -3,7 +3,7 @@ import { chromium } from '@playwright/test';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { coverageDir, inlineMap, savePageCoverage, startPageCoverage } from './copertura-mappa.mjs';
 import { chooseObsidian } from './obsidian-versioni.mjs';
 import { consoleSource, windowTeardownError } from './console-policy.mjs';
@@ -13,8 +13,15 @@ import { fileHash, ourFrames, record, registryFile, sourceMapper } from './regis
 // registry of every suite (tests/registro.mjs).
 export { record, registryFile };
 export const root = join(process.cwd(), '.obsidian-test');
-export const vault = join(root, 'vault');
-const config = join(root, 'config');
+// The Obsidian runtimes (obsidian-<version>/), the suite's screenshots and the
+// tools stay in `root`, shared and only read here. This run's own vault,
+// Obsidian profile and source map go into `bench`: `root` itself, or the
+// folder IW_BANCO names (the error bench's own environment,
+// tests/banco-errori-ambiente.mjs), so that one never touches the other's.
+export const bench = process.env.IW_BANCO ? resolve(process.env.IW_BANCO) : root;
+export const vault = join(bench, 'vault');
+export const config = join(bench, 'config');
+export const mapDir = join(bench, 'mappa');
 const pluginId = 'image-rows-and-wraps';
 // With `npm run test:copertura` the app runs a build mapped back to the
 // sources (tests/copertura.mjs makes it), instead of the production one.
@@ -27,7 +34,7 @@ const appBundle = appBundleDir ? join(appBundleDir, 'main.js') : 'main.js';
 async function pluginMap() {
 	const code = await readFile(appBundle, 'utf8');
 	if (coverageDir) return { code, map: sourceMapper(inlineMap(code), appBundleDir), how: 'copertura' };
-	const dir = join(root, 'mappa');
+	const dir = mapDir;
 	await rm(dir, { recursive: true, force: true });
 	spawnSync(process.execPath, ['esbuild.config.mjs', 'mappa', join(dir, 'main.js')], { stdio: 'ignore' });
 	const built = await readFile(join(dir, 'main.js'), 'utf8').catch(() => undefined);
@@ -66,6 +73,8 @@ async function obsidianBinary() {
 
 // Colored PNGs of a given size, drawn by Chromium so no image dependency is needed.
 async function writeImages(images) {
+	// No image to draw (the error bench's vault): no browser either.
+	if (!images.length) return;
 	const browser = await chromium.launch({ headless: true });
 	const page = await browser.newPage();
 	for (const [name, width, height, color] of images) {
@@ -113,10 +122,14 @@ async function connect(deadline) {
 }
 
 // The bench app's processes still running: every Obsidian started with this
-// bench's own configuration folder (never the user's apps).
-function benchProcesses() {
+// bench's own configuration folder, exactly that folder (never the user's
+// apps, nor another bench, the suite's or the error bench's, even one whose
+// folder begins with the same path). pgrep reads an extended regular
+// expression: the path is escaped, and must end where the argument ends.
+export function benchProcesses(dir = config) {
+	const exact = `--user-data-dir=${dir.replace(/[.[\]()*+?^${}|\\]/g, '\\$&')}( |$)`;
 	try {
-		return execFileSync('pgrep', ['-f', '--', `--user-data-dir=${config}`], { encoding: 'utf8' }).split('\n').map(Number).filter(pid => pid && pid !== process.pid);
+		return execFileSync('pgrep', ['-f', '--', exact], { encoding: 'utf8' }).split('\n').map(Number).filter(pid => pid && pid !== process.pid);
 	} catch { return []; }
 }
 
@@ -177,26 +190,141 @@ async function start(page, app) {
 	// When a secondary window (a pop-out opened by a test) last closed: the
 	// structural evidence of windowTeardownError (console-policy.mjs).
 	let secondaryClosedAt;
-	page.context().on('page', other => { if (other !== page) other.once('close', () => { secondaryClosedAt = Date.now(); }); });
-	const note = (level, text, where, stack, event = 'console') => {
+	// Every observation says how it arrived (`event`: 'console', 'pageerror',
+	// 'window-error' or 'unhandledrejection'), from which window ('principale'
+	// or 'separata') and that window's number (`windowId`: 0 the main window,
+	// then each other window of the app in the order the bench sees it; null if
+	// the window had no number yet). One event may be observed by more than one
+	// channel of the same window (a thrown error is a `pageerror` and its
+	// window's `error` event): the window number, channel and time tell those
+	// observations from independent occurrences. Neither messages nor stacks
+	// are used to merge them, and nothing is prevented or filtered.
+	const note = (level, text, where, stack, { event = 'console', window = 'principale', windowId = 0, observedAt = Date.now() } = {}) => {
 		const frames = ourFrames(stack, bundles);
 		const sinceSecondaryClose = secondaryClosedAt === undefined ? undefined : Date.now() - secondaryClosedAt;
 		const source = consoleSource({ frames, where, stack, pluginId, bundleUrls: bundles.map(bundle => bundle.url), event, sinceSecondaryClose });
 		const teardown = source === 'external' && windowTeardownError({ event, where, stack, sinceSecondaryClose });
-		(level === 'warning' ? warnings : errors).push({ source, text, test: state.current, frames, ...(teardown ? { teardown } : {}) });
+		const channel = { ...(event === 'console' ? {} : { event }), window, windowId };
+		(level === 'warning' ? warnings : errors).push({ source, text, test: state.current, frames, ...channel, observedAt, ...(teardown ? { teardown } : {}) });
 		record({ kind: 'console', level, source, test: state.current, text, where, ...(frames.length ? { frames } : {}),
+			...(stack ? event === 'console' ? { attributionStack: stack } : { stack } : {}), ...channel, observedAt: new Date(observedAt).toISOString(),
 			...(teardown ? { teardown, sinceSecondaryClose } : {}) });
 	};
-	page.on('pageerror', error => note('error', error.message, '', error.stack ?? '', 'pageerror'));
-	page.on('console', message => {
+	const consoleNote = (message, window, windowId) => {
 		const level = message.type();
 		if (level !== 'error' && level !== 'warning') return;
 		const { url = '', lineNumber = 0, columnNumber = 0 } = message.location() ?? {};
 		// The text may hold a stack of its own (an error logged): its frames first.
-		const [first, ...stack] = message.text().split('\n');
-		note(level, first, url, `${stack.join('\n')}\nat (${url}:${lineNumber + 1}:${columnNumber + 1})`);
-	});
+		const text = message.text();
+		const [, ...stack] = text.split('\n');
+		note(level, text, url, `${stack.join('\n')}\nat (${url}:${lineNumber + 1}:${columnNumber + 1})`, { window, windowId });
+	};
+	const onPageError = error => note('error', error.message, '', error.stack ?? '', { event: 'pageerror' });
+	const onConsole = message => consoleNote(message, 'principale', 0);
+	page.on('pageerror', onPageError);
+	page.on('console', onConsole);
+	// Every other window of the app (pop-outs, the print window, any other) is a
+	// page of its own: its console messages and uncaught exceptions reach only
+	// that page, never the main one. Each gets its number when the bench first
+	// sees it, written into the window (`iwBenchWindowId`, the only thing the
+	// bench sets there) so that its `error` and `unhandledrejection` events,
+	// listened from the main window below, carry the same number. Windows
+	// already there count too; a window's listeners go when it closes.
+	const context = page.context();
+	const secondary = new Map();
+	let nextWindow = 1;
+	const watchPage = other => {
+		if (other === page || secondary.has(other) || other.isClosed()) return;
+		const windowId = nextWindow++;
+		const onError = error => note('error', error.message, '', error.stack ?? '', { event: 'pageerror', window: 'separata', windowId });
+		const onMessage = message => consoleNote(message, 'separata', windowId);
+		const mark = () => { other.evaluate(id => { window.iwBenchWindowId = id; }, windowId).catch(() => {}); };
+		const forget = () => {
+			other.off('pageerror', onError);
+			other.off('console', onMessage);
+			other.off('load', mark);
+			secondary.delete(other);
+		};
+		other.on('pageerror', onError);
+		other.on('console', onMessage);
+		other.on('load', mark);
+		other.once('close', () => { secondaryClosedAt = Date.now(); forget(); });
+		secondary.set(other, forget);
+		mark();
+	};
+	context.on('page', watchPage);
+	for (const other of context.pages()) watchPage(other);
 	await page.waitForFunction(() => window.app?.workspace?.layoutReady, null, { timeout: 60000 });
+	// Some errors reach only a window's own `error` event, neither `pageerror`
+	// nor the console: a ResizeObserver loop ("ResizeObserver loop completed
+	// with undelivered notifications") is one; a promise rejected with no
+	// handler reaches its window's `unhandledrejection` event. Both listened,
+	// from the moment the app is ready, in the main window and in each separate
+	// window: those already open, then each one Obsidian opens (its
+	// `window-open` event), all from the main window. Every observation is kept,
+	// including a thrown value in the main window: its presence does not prove
+	// that pageerror received the same occurrence.
+	await page.exposeBinding('iwWindowError', (_source, report) => note('error', report.text, report.where, report.stack,
+		{ event: report.event, window: report.window, windowId: report.windowId, observedAt: report.observedAt }));
+	const listenWindowErrors = () => page.evaluate(() => {
+		if (window.iwWindowErrors) return;
+		window.iwBenchWindowId = 0;
+		const listening = window.iwWindowListening = new Map();
+		const describe = value => {
+			try {
+				if (value && typeof value === 'object' && typeof value.message === 'string') return value.message;
+				return String(value);
+			} catch { return '(valore non rappresentabile)'; }
+		};
+		const listen = (win, name) => {
+			if (!win || listening.has(win)) return;
+			const report = (event, text, where, stack) => window.iwWindowError({ event, text, where, stack, window: name,
+				windowId: win.iwBenchWindowId ?? null, observedAt: Date.now() });
+			const onError = event => report('window-error', event.message || String(event.error),
+				event.filename ? `${event.filename}:${event.lineno}:${event.colno}` : '', typeof event.error?.stack === 'string' ? event.error.stack : '');
+			const onRejection = event => report('unhandledrejection', describe(event.reason), '', typeof event.reason?.stack === 'string' ? event.reason.stack : '');
+			win.addEventListener('error', onError);
+			win.addEventListener('unhandledrejection', onRejection);
+			listening.set(win, () => { win.removeEventListener('error', onError); win.removeEventListener('unhandledrejection', onRejection); });
+		};
+		const forget = win => { listening.get(win)?.(); listening.delete(win); };
+		listen(window, 'principale');
+		for (const split of window.app.workspace.floatingSplit?.children ?? []) if (split.win !== window) listen(split.win, 'separata');
+		const refs = [
+			window.app.workspace.on('window-open', (_workspaceWindow, win) => listen(win, 'separata')),
+			window.app.workspace.on('window-close', (_workspaceWindow, win) => forget(win)),
+		];
+		window.iwWindowErrors = () => {
+			for (const ref of refs) window.app.workspace.offref(ref);
+			const removed = listening.size;
+			for (const win of Array.from(listening.keys())) forget(win);
+			delete window.iwWindowErrors;
+			return removed;
+		};
+	});
+	await listenWindowErrors();
+	// After a reload of the main window: listened again once the app is ready
+	// (the windows restored meanwhile included), with the main window's number.
+	const relisten = () => { page.waitForFunction(() => window.app?.workspace?.layoutReady, null, { timeout: 60000 }).then(listenWindowErrors).catch(() => {}); };
+	page.on('load', relisten);
+	// What is listened now: secondary pages and windows with listeners in the
+	// page (the main one included), for the bench's own check.
+	const listening = async () => ({ pages: secondary.size,
+		windows: await page.evaluate(() => window.iwWindowListening?.size ?? 0).catch(() => null) });
+	// Every listener goes when the app closes; how many windows had one is kept.
+	let stopped;
+	const stop = async () => {
+		if (stopped) return stopped;
+		context.off('page', watchPage);
+		page.off('load', relisten);
+		page.off('pageerror', onPageError);
+		page.off('console', onConsole);
+		const pages = secondary.size;
+		for (const forget of Array.from(secondary.values())) forget();
+		const windows = await page.evaluate(() => window.iwWindowErrors?.() ?? 0).catch(() => null);
+		return stopped = { pages, windows };
+	};
+	const close = async () => { await stop(); await app.close(); };
 	// First opening of a vault with plugins asks whether to trust its author.
 	// Its button would also open the settings, in a window of their own over the
 	// app: the same choice is made here without it, and the question
@@ -229,7 +357,7 @@ async function start(page, app) {
 	// over CDP the app window never gets that event: it is sent once here, and
 	// again by openNote.
 	await page.evaluate(() => window.dispatchEvent(new FocusEvent('focus')));
-	return { app, page, errors, warnings, state };
+	return { app: { close }, page, errors, warnings, state, listening, stop };
 }
 
 /** Opens a note in the given mode ('live' | 'reading') and waits for the view to settle. */

@@ -26,15 +26,18 @@ export class PreviewInteraction {
 		if (this.drag && update.docChanged) this.drag.anchor = update.changes.mapPos(this.drag.anchor);
 	}
 	// `top`: where the clicked element is on screen, before its source replaces it.
-	private hit(event: Event): { root: HTMLElement; position: number; top: number } | undefined {
+	// `line`: the position whose line goes there: the clicked element's, or the
+	// block's first line for a click on the block itself (an empty point).
+	private hit(event: Event): { root: HTMLElement; position: number; top: number; line: number } | undefined {
 		const target = eventElement(event);
 		const root = target?.closest<HTMLElement>('.iw-preview, .iw-marker');
 		if (!root || !this.view.contentDOM.contains(root)) return undefined;
 		const hit = previewTargets.get(root);
 		const start = hit ? previewStart(this.view, root) : undefined;
 		if (!hit || start === undefined) return undefined;
-		return { root, position: start + Math.max(0, Math.min(hit.length, previewPosition(target!, root, hit.fallback))),
-			top: previewElement(target!, root).getBoundingClientRect().top };
+		const element = previewElement(target!, root);
+		const position = start + Math.max(0, Math.min(hit.length, previewPosition(target!, root, hit.fallback)));
+		return { root, position, top: element.getBoundingClientRect().top, line: element === root ? start : position };
 	}
 	pointerdown(event: PointerEvent): boolean {
 		if (event.button !== 0 || event.ctrlKey || event.metaKey || event.altKey) return false;
@@ -49,10 +52,19 @@ export class PreviewInteraction {
 		this.drag = { anchor, pointerId: event.pointerId, x: event.clientX, y: event.clientY };
 		// The clicked line stays where it was on screen. In the source a wrap's
 		// text is below its image, not beside it: without this the clicked words
-		// slid down by the image's height.
-		const margin = Math.max(0, hit.top - this.view.scrollDOM.getBoundingClientRect().top);
-		this.view.dispatch({ selection: EditorSelection.single(anchor, hit.position), userEvent: 'select.pointer',
-			effects: EditorView.scrollIntoView(hit.position, { y: 'start', yMargin: margin }) });
+		// slid down by the image's height. What is kept is the top of the line,
+		// not the caret: a scroll target aligns the caret, which on a row's line
+		// sits below the images Obsidian shows there (117 px) and a few px below
+		// a text line's top; each entry shifted the note by that much. The scroll
+		// is corrected in CodeMirror's measure phase, before the frame is drawn
+		// (a correction a frame later shows as a jump). An element starting above
+		// the screen brings its line to the top, as before, so the caret is seen.
+		const wanted = Math.max(hit.top, this.view.scrollDOM.getBoundingClientRect().top);
+		const line = hit.line;
+		this.view.dispatch({ selection: EditorSelection.single(anchor, hit.position), userEvent: 'select.pointer' });
+		this.view.requestMeasure({ key: 'iw-entry-anchor',
+			read: view => view.documentTop + view.lineBlockAt(line).top - wanted,
+			write: (offset, view) => { if (Math.abs(offset) >= 0.5) view.scrollDOM.scrollTop += offset; } });
 		this.view.focus();
 		return true;
 	}

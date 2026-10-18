@@ -3,7 +3,7 @@ import { defaultSettings, type ImageSettings } from '../src/settings';
 import { history, undo, redo, undoDepth } from '@codemirror/commands';
 import { EditorState, EditorSelection, Compartment, StateEffect, StateField, type Range } from '@codemirror/state';
 import { Decoration, EditorView, WidgetType, lineNumbers, type DecorationSet } from '@codemirror/view';
-import { Plugin, TFile, appListeners, editorLivePreviewField, editorInfoField, notices, runtime } from './obsidian-stub';
+import { Plugin, TFile, MarkdownRenderChild, appListeners, editorLivePreviewField, editorInfoField, notices, runtime } from './obsidian-stub';
 import { createLivePreview, refreshLivePreviews } from '../src/rendering/live-preview';
 import { registerReadingView } from '../src/rendering/reading-view';
 import { START, END } from '../src/markdown/model';
@@ -72,6 +72,8 @@ const plugin = new Plugin();
 plugin.load();
 let liveSettings: ImageSettings = defaultSettings();
 const refreshReading = registerReadingView(plugin as never, () => liveSettings);
+// The render child of the last section made by runReadingSection.
+let readingChild: unknown;
 const view = new EditorView({ parent: document.querySelector('#editor')!, state: EditorState.create({
 	doc: text,
 	extensions: [nativeEmbeds.of([]), strayWrapBar.of([]), lineNumbers(), history(), editorLivePreviewField, editorInfoField, createLivePreview(plugin as never, () => liveSettings), EditorView.lineWrapping,
@@ -106,6 +108,8 @@ registerReadingView(exportPlugin as never, () => exportSettings);
 	text,
 	ownerDocumentRegression, cursorRegression,
 	setDoc(doc: string) { view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: doc }, selection: { anchor: 0 } }); },
+	// A change elsewhere, the selection left where it is (mapped).
+	edit(from: number, to: number, insert: string) { view.dispatch({ changes: { from, to, insert } }); },
 	nativeEmbeds(on: boolean) { view.dispatch({ effects: nativeEmbeds.reconfigure(on ? nativeEmbedField : []) }); },
 	strayWrapBar(position: number) {
 		view.dispatch({ effects: strayWrapBar.reconfigure(EditorView.decorations.of(Decoration.set([
@@ -167,6 +171,59 @@ registerReadingView(exportPlugin as never, () => exportSettings);
 	// As Obsidian after a change that leaves a section's HTML identical (a
 	// comment): the source changes, the section is kept, nothing is called.
 	changeReadingSourceQuietly(source: string) { readingSource = source; },
+	async readingEditorEvents() {
+		const local = new Plugin();
+		const events = new Map<string, (...args: unknown[]) => void>();
+		const owner = { on: (name: string, callback: (...args: unknown[]) => void) => { events.set(name, callback); return {}; } };
+		local.app = { vault: owner, metadataCache: owner, workspace: owner };
+		local.load();
+		registerReadingView(local as never, () => defaultSettings());
+		const reads = { a: 0, b: 0 };
+		const source = { a: '![[a.png|100]] %%iw-row align=left%%', b: '![[b.png|100]] %%iw-row align=left%%' };
+		const children: Record<string, MarkdownRenderChild> = {};
+		const sections: Record<string, HTMLElement> = {};
+		const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+		try {
+			for (const path of ['a', 'b'] as const) {
+				const section = document.body.createDiv({ cls: 'markdown-reading-view' });
+				sections[path] = section;
+				const p = section.createEl('p');
+				const embed = p.createSpan({ cls: 'internal-embed image-embed' });
+				embed.setAttribute('src', `${path}.png`);
+				embed.createEl('img', { attr: { width: '100', height: '80' } });
+				await local.postprocessor!(section, { sourcePath: `${path}.md`, getSectionInfo: () => { reads[path]++; return { text: source[path], lineStart: 0, lineEnd: 0 }; }, addChild: (child: MarkdownRenderChild) => { children[path] = child; local.addChild(child); } });
+			}
+			await sleep(80);
+			reads.a = reads.b = 0;
+			source.a = source.a.replace('align=left', 'align=right');
+			events.get('editor-change')!(null, { file: { path: 'a.md' } });
+			await sleep(80);
+			const targeted = { a: reads.a, b: reads.b, right: sections.a!.querySelector('p')!.classList.contains('iw-row-align-right') };
+			let mutations = 0;
+			const observer = new MutationObserver(records => { mutations += records.length; });
+			observer.observe(sections.a!, { subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+			// Ordinary typing changes the text but not the row's semantic key.
+			for (let index = 0; index < 30; index++) {
+				source.a = `![[a.png|100]] %%iw-row align=right%%\n\nTyping ${index}`;
+				events.get('editor-change')!(null, { file: { path: 'a.md' } });
+				await sleep(20);
+			}
+			await sleep(550);
+			observer.disconnect();
+			const typing = { mutations, b: reads.b };
+			events.get('editor-change')!(null, { file: { path: 'a.md' } });
+			children.a!.unload(); sections.a!.remove();
+			const afterClose = reads.a;
+			await sleep(550);
+			const closed = reads.a === afterClose;
+			events.get('editor-change')!(null, { file: { path: 'b.md' } });
+			local.unload();
+			const afterUnload = reads.b;
+			events.get('editor-change')!(null, { file: { path: 'b.md' } });
+			await sleep(550);
+			return { targeted, typing, closed, unloaded: reads.b === afterUnload };
+		} finally { local.unload(); for (const section of Object.values(sections)) section.remove(); }
+	},
 	// One Reading section holding exactly one source line, as getSectionInfo reports it.
 	runReadingSection(source: string, line: number, embeds: { width: number; src: string }[]) {
 		readingSource = source;
@@ -182,8 +239,10 @@ registerReadingView(exportPlugin as never, () => exportSettings);
 			p.append(' ');
 		}
 		return (plugin as unknown as { postprocessor: (el: HTMLElement, ctx: unknown) => Promise<void> }).postprocessor(section,
-			{ getSectionInfo: () => ({ text: readingSource, lineStart: line, lineEnd: line }), sourcePath: 'lettura.md', addChild: (child: never) => plugin.addChild(child) });
+			{ getSectionInfo: () => ({ text: readingSource, lineStart: line, lineEnd: line }), sourcePath: 'lettura.md', addChild: (child: never) => { readingChild = child; plugin.addChild(child); } });
 	},
+	// That section closed by Obsidian (its render child unloaded), the plugin still loaded.
+	unloadReadingSection() { (readingChild as { unload(): void } | undefined)?.unload(); },
 	// A whole note in Reading view: one native section per block of lines
 	// separated by blank lines, processed in order as Obsidian does.
 	async runReadingNote(source: string) {

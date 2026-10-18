@@ -16,14 +16,32 @@ export function windowTeardownError({ event, where = '', stack = '', sinceSecond
 		&& Number.isFinite(sinceSecondaryClose) && sinceSecondaryClose >= 0 && sinceSecondaryClose <= TEARDOWN_WINDOW_MS;
 }
 
-/** @param {{ frames?: string[], where?: string, stack?: string, pluginId?: string, bundleUrls?: string[], event?: string, sinceSecondaryClose?: number }} evidence */
+// A location is evidence only when it names a script, or a line of a page. The
+// page alone with no line, or line 0 (`app://obsidian.md/index.html:0:0`,
+// `about:blank:0:0`), is where the browser puts an event no script raised, a
+// ResizeObserver loop among them: it says nothing about who caused it.
+function placeOf(where) {
+	const [, url = '', line] = /^(.*?)(?::(\d+)(?::\d+)?)?$/.exec(String(where ?? '').trim()) ?? [];
+	if (!url) return '';
+	const page = /^about:/.test(url) || /\.html?(?:[?#].*)?$/i.test(url);
+	return page && !(Number(line) > 0) ? '' : where;
+}
+// The frames of a stack, not its first line: that one is the message.
+const stackFrames = stack => String(stack ?? '').split('\n').filter(line => /^\s*at\s/.test(line)).join('\n');
+
+// The technical source of an observation, never its proven cause: `plugin` when
+// a frame or a location leads to the plugin's code, `external` only when a
+// frame or a location leads elsewhere (or windowTeardownError holds),
+// `uncertain` otherwise. An error object (`hasError`) is accepted with the
+// other metadata but proves nothing by itself: only the frames of its stack do.
+/** @param {{ frames?: string[], where?: string, stack?: string, pluginId?: string, bundleUrls?: string[], event?: string, sinceSecondaryClose?: number, hasError?: boolean }} evidence */
 export function consoleSource({ frames = [], where = '', stack = '', pluginId = 'image-rows-and-wraps', bundleUrls = [], event, sinceSecondaryClose }) {
 	if (frames.some(frame => frame.startsWith('src/'))) return 'plugin';
 	const location = `${where}\n${stack}`;
 	if (bundleUrls.some(url => url && location.includes(url))) return 'plugin';
 	const escapedId = pluginId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 	if (new RegExp(`(?:plugins[\\\\/]+${escapedId}[\\\\/]|plugin:${escapedId}(?:[\\s/:]|$))`).test(location)) return 'plugin';
-	if (where || /(?:https?|file|app|node|electron|chrome-extension):\/\/|(?:^|[\s(])\/?(?:[^\s():]+\/)+[^\s():]+:\d+/m.test(stack)) return 'external';
+	if (placeOf(where) || /(?:https?|file|app|node|electron|chrome-extension):\/\/|(?:^|[\s(])\/?(?:[^\s():]+\/)+[^\s():]+:\d+/m.test(stackFrames(stack))) return 'external';
 	if (frames.length === 0 && windowTeardownError({ event, where, stack, sinceSecondaryClose })) return 'external';
 	return 'uncertain';
 }

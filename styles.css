@@ -6,33 +6,47 @@
 	max-width: var(--iw-wrap-max, 45%);
 	margin-block: 0 0.25em;
 }
-.image-embed.iw-left { float: left; margin-inline: 0 var(--iw-wrap-gap, 1em); }
-.image-embed.iw-right { float: right; margin-inline: var(--iw-wrap-gap, 1em) 0; }
+
+.image-embed.iw-left {
+	float: left;
+	margin-inline: 0 var(--iw-wrap-gap, 1em);
+}
+
+.image-embed.iw-right {
+	float: right;
+	margin-inline: var(--iw-wrap-gap, 1em) 0;
+}
+
 .image-embed:is(.iw-left, .iw-right) img {
 	max-width: 100%;
 	height: auto;
 	vertical-align: top;
 }
-/* Sections inside a region must share their parent's formatting context. */
-.markdown-preview-view .iw-reading-section:not(p):not(ul):not(ol):not(.internal-embed):not(.image-embed) {
-	display: contents;
-}
-/* Keep native Reading sections measurable. Flattening these wrap containers
-   caused scroll jumps in Obsidian, including with already loaded images.
-   The image-only paragraph remains flattened to allow text beside its float. */
-.markdown-reading-view .markdown-preview-view .iw-reading-section:not(p):not(ul):not(ol):not(.internal-embed):not(.image-embed) {
-	display: block;
-}
+
 .iw-region-start::before,
 .iw-region-end::after {
 	content: '';
 	display: block;
 	clear: both;
 }
+
 /* PDF export: the block after a wrap, for a last block that is a formatting
    context of its own (a table's container), where the clear above stays inside
    it (reading-export.ts). */
 .iw-after-region { clear: both; }
+
+/* PDF export of an embedded note, whose blocks are bare: margins must not
+   collapse through the empty carrier of the image, or a printed page that
+   ends just inside its float sends the whole embedded note to the next
+   page. The block after the carrier starts beside the image, as when the
+   margins collapsed (reading-export.ts).
+   0.02px is any non-zero padding: Chromium keeps it as its smallest layout
+   unit (1/64 px), invisible, and that alone stops the collapse. A value
+   rounded to zero would bring the jump back; the PDF regression in
+   tests/obsidian.mjs fails if it does. */
+.iw-export-block.iw-image-carrier { padding-block-start: 0.02px; }
+.iw-export-block.iw-export-after-carrier { margin-block-start: 0; }
+
 /* The marker's own line is ordinary visible text in the source (kept that
    way so it survives into exported DOMs); Reading view hides it here, and
    the text sections of a wrap drawn whole in its image section
@@ -41,75 +55,97 @@
 .iw-section-hidden {
 	display: none;
 }
-/* Keep the hidden native sections measurable for Reading virtualization,
-   without rendering their text or introducing a float boundary. */
-.markdown-reading-view .markdown-preview-view :is(.iw-marker-hidden, .iw-section-hidden) {
-	display: block;
-	visibility: hidden;
-	height: 1px;
-	min-height: 1px;
-	margin: 0;
-	padding: 0;
-	border: 0;
-	font-size: 0;
-	line-height: 0;
-}
-.markdown-reading-view .markdown-preview-view :is(.iw-marker-hidden, .iw-section-hidden) > * {
-	display: none;
-}
+
 /* The image section of such a wrap shows the whole wrap instead of its own
    native content: one flow-root box, as tall as the wrap. */
 .iw-wrap-host > :not(.iw-reading-wrap) {
 	display: none;
 }
+
 /* The complete rendered region is one formatting context. */
+
 /* CodeMirror measures the widget border box: keep spacing inside that box
    so gutter heights include it after source/preview transitions. */
-.iw-preview { position: relative; display: flow-root; margin-block: 0; padding-block: 0.25em; }
+.iw-preview {
+	position: relative;
+	display: flow-root;
+	margin-block: 0;
+	padding-block: 0.25em;
+}
+
 /* Beside a widget as wide as the line, the invisible buffers CodeMirror puts
    around inline widgets (for the caret) each took a line box of their own:
    24 px above and below every row and wrap in Live Preview, where Obsidian's
    own blocks sit one blank line (about 26 px) from the text. Obsidian keeps
    them displayed (!important), so they stay, with no height, on a line whose
    own line height is zero; the widget has the normal one. The caret never
-   stands beside these widgets: on their line the Markdown is shown instead. */
-.cm-line:has(> .iw-preview) { line-height: 0; }
-.cm-line > .cm-widgetBuffer:has(+ .iw-preview),
-.cm-line > .iw-preview + .cm-widgetBuffer { height: 0; vertical-align: top; }
+   stands beside these widgets: on their line the Markdown is shown instead.
+   The plugin marks the line it draws a widget on (iw-preview-line,
+   live-preview.ts): everything on it but the widget is such a buffer. */
+.cm-line.iw-preview-line { line-height: 0; }
+
+.cm-line.iw-preview-line > :not(.iw-preview) {
+	height: 0;
+	vertical-align: top;
+}
 .cm-line > .iw-preview { line-height: var(--line-height-normal, 1.5); }
-/* In Live Preview the blank lines of the Markdown already part a row from the
-   text: no paragraph margins inside the widget too (Reading keeps them). */
-.iw-row-preview > p.iw-row { margin-block: 0; }
+
 /* A row being drawn keeps its last known height (row-widget.ts). */
-.iw-row-preview.iw-row-pending { box-sizing: border-box; height: var(--iw-row-pending-height); overflow: hidden; }
+.iw-row-preview.iw-row-pending {
+	box-sizing: border-box;
+	height: var(--iw-row-pending-height);
+	overflow: hidden;
+}
+
 /* Rendered Markdown must not inherit CodeMirror's pre/break-spaces: the literal
    newline after a hidden <br> would otherwise still create an empty line. */
 .iw-preview-content { white-space: normal; }
-.iw-preview-content > .el-p { display: contents; }
 .iw-preview:focus-visible { outline: 2px solid var(--interactive-accent); }
 .iw-preview-fallback { white-space: pre-wrap; }
-.iw-marker { font-family: var(--font-monospace); color: var(--text-muted); }
+
+.iw-marker {
+	font-family: var(--font-monospace);
+	color: var(--text-muted);
+}
 .cm-line.iw-editing-boundary { color: var(--text-muted); }
 
 /* An image-only paragraph must not leave an empty line box and paragraph margins
    before the text next to its float. These classes are limited to wrap content. */
-p.iw-image-paragraph { display: contents; }
+p.iw-image-paragraph { display: block; }
 p.iw-first-paragraph { margin-block-start: 0; }
 
 /* Compact paragraph spacing only around plugin-aligned images.
-   Keep normal paragraph spacing elsewhere and preserve editable blank lines. */
-.iw-preview-content > p:first-child,
-.iw-preview-content > .el-p:first-child > p:first-child {
+   Keep normal paragraph spacing elsewhere and preserve editable blank lines.
+   Rules for the same paragraphs go from the least to the most specific, so
+   that their order never decides between them. */
+.iw-preview-content > p:first-child {
 	margin-block-start: 0;
 }
+
+.iw-preview-content > p:last-child {
+	margin-block-end: 0.25em;
+}
+
 .markdown-preview-view p.iw-region-start,
 .markdown-preview-view .iw-region-start > p:first-child {
 	margin-block-start: 0.25em;
 }
-.iw-preview-content > p:last-child,
+
+/* A wrap whose first paragraph is its image alone (image-layout.ts): that
+   paragraph is replaced by a carrier as soon as it is rendered, and the
+   next one starts at the top. */
+.iw-leading-image-only .iw-preview-content > p:nth-child(2) { margin-block-start: 0; }
+
+/* The same paragraphs inside the .el-p sections of the Markdown renderer. */
+.iw-preview-content > .el-p:first-child > p:first-child {
+	margin-block-start: 0;
+}
+
 .iw-preview-content > .el-p:last-child > p:last-child {
 	margin-block-end: 0.25em;
 }
+
+.iw-leading-image-only .iw-preview-content > .el-p:nth-child(2) > p:first-child { margin-block-start: 0; }
 
 /* Obsidian can render image + newline + text as one paragraph. The leading
    break would create an empty text line next to the float. Hide only that
@@ -135,28 +171,27 @@ p > .image-embed:is(.iw-left, .iw-right):first-child + br {
 	display: flow-root;
 }
 
+/* Keep native Reading sections measurable. Flattening these wrap containers
+   caused scroll jumps in Obsidian, including with already loaded images.
+   The image-only paragraph is replaced by a reversible DIV carrier, which
+   keeps the float beside the following text (image-layout.ts). */
+.markdown-reading-view .markdown-preview-view .iw-reading-section:not(p, ul, ol, .internal-embed, .image-embed) {
+	display: block;
+}
+
 /* Owner-document overlay for drag insertion, never intercept pointer events.
    On Obsidian's layer for dragged items, above menus and tooltips. */
 .iw-drop-indicator {
 	position: fixed; pointer-events: none; z-index: var(--layer-dragged-item, 80);
 	left: var(--iw-drop-left); top: var(--iw-drop-top);
 	width: var(--iw-drop-width); height: var(--iw-drop-height);
+
 	/* Green, not the accent: the pressed image is already outlined in the accent. */
 	background: var(--color-green, #3a9d5d); border-radius: 2px;
 }
 
-/* Keep feedback inside the image bounds: native embed containers may clip
-   external outlines. Negative offsets preserve layout and resize geometry. */
-.markdown-source-view.mod-cm6 .iw-image-feedback img:hover {
-	outline: 2px solid var(--text-muted);
-	outline-offset: -2px;
-}
-.markdown-source-view.mod-cm6 .iw-image-feedback.iw-image-active img {
-	outline: 3px solid var(--interactive-accent);
-	outline-offset: -3px;
-}
-
 body.iw-gesture.iw-drag-forbidden, body.iw-gesture.iw-drag-forbidden * { cursor: not-allowed; }
+
 .iw-drop-rejection {
 	position: fixed;
 	left: var(--iw-hint-left);
@@ -173,23 +208,13 @@ body.iw-gesture.iw-drag-forbidden, body.iw-gesture.iw-drag-forbidden * { cursor:
 	font-size: var(--font-ui-small);
 }
 
-/* Region hover is distinct from image hover and never changes its geometry. */
-.markdown-source-view.mod-cm6 .iw-preview:hover:not(:has(img:hover)) {
+/* Region hover is distinct from image hover and never changes its geometry:
+   with an image under the pointer (iw-image-hover, image-feedback.ts) only the
+   image is outlined. */
+.markdown-source-view.mod-cm6 .iw-preview:hover:not(.iw-image-hover) {
 	outline: 1px solid var(--text-muted);
 	outline-offset: -1px;
 }
-
-
-/* Activate known layout before renderer callbacks annotate individual embeds. */
-:is(.iw-layout-iw-left, .iw-layout-iw-right) :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > p:first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > p:first-child > .image-embed:first-child) { width: var(--iw-resize-width, max-content); max-width: var(--iw-wrap-max, 45%); margin-block: 0 0.25em; }
-.iw-layout-iw-left :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > p:first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > p:first-child > .image-embed:first-child) { float: left; margin-inline: 0 var(--iw-wrap-gap, 1em); }
-.iw-layout-iw-right :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > p:first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > p:first-child > .image-embed:first-child) { float: right; margin-inline: var(--iw-wrap-gap, 1em) 0; }
-:is(.iw-layout-iw-left, .iw-layout-iw-right) :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > p:first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > p:first-child > .image-embed:first-child) img { max-width: 100%; height: auto; vertical-align: top; }
-:is(.iw-layout-iw-left, .iw-layout-iw-right) :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > p:first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > p:first-child > .image-embed:first-child) + br { display: none; }
-.iw-leading-image-only .iw-preview-content > p:first-child,
-.iw-leading-image-only .iw-preview-content > .el-p:first-child > p:first-child { display: contents; }
-.iw-leading-image-only .iw-preview-content > p:nth-child(2),
-.iw-leading-image-only .iw-preview-content > .el-p:nth-child(2) > p:first-child { margin-block-start: 0; }
 
 /* Image rows: one flex band per paragraph, at most 700px wide. Widths and gap
    are percentages of the band, so the whole composition scales together and
@@ -199,23 +224,99 @@ p.iw-row {
 	flex-wrap: nowrap;
 	box-sizing: border-box;
 	width: min(100%, 700px);
-	column-gap: var(--iw-row-gap, 0);
+	gap: 0 var(--iw-row-gap, 0);
 	clear: both;
 	break-inside: avoid;
 	margin-inline: 0 auto;
 }
-p.iw-row > .internal-embed { flex: 0 1 var(--iw-row-width, auto); min-width: 0; max-width: none; margin: 0; }
-p.iw-row > .internal-embed img { display: block; width: 100%; max-width: 100%; height: auto; }
+
+/* In Live Preview the blank lines of the Markdown already part a row from the
+   text: no paragraph margins inside the widget too (Reading keeps them). */
+.iw-row-preview > p.iw-row { margin-block: 0; }
+
+p.iw-row > .internal-embed {
+	flex: 0 1 var(--iw-row-width, auto);
+	min-width: 0;
+	max-width: none;
+	margin: 0;
+}
+
+/* Live Preview: the anchor of the image's resize handle (below). */
+.iw-row-preview p.iw-row > .internal-embed { position: relative; }
+
+p.iw-row > .internal-embed img {
+	display: block;
+	width: 100%;
+	max-width: 100%;
+	height: auto;
+}
 p.iw-row.iw-row-align-left { justify-content: flex-start; }
-p.iw-row.iw-row-align-center { justify-content: center; margin-inline: auto; }
-p.iw-row.iw-row-align-right { justify-content: flex-end; margin-inline: auto 0; }
-p.iw-row.iw-row-align-between { justify-content: space-between; margin-inline: auto; }
-p.iw-row.iw-row-align-evenly { justify-content: space-evenly; margin-inline: auto; }
+
+p.iw-row.iw-row-align-center {
+	justify-content: center;
+	margin-inline: auto;
+}
+
+p.iw-row.iw-row-align-right {
+	justify-content: flex-end;
+	margin-inline: auto 0;
+}
+
+p.iw-row.iw-row-align-between {
+	justify-content: space-between;
+	margin-inline: auto;
+}
+
+p.iw-row.iw-row-align-evenly {
+	justify-content: space-evenly;
+	margin-inline: auto;
+}
+
 /* Distributed modes with a single image: centered in the centered band. */
 p.iw-row:is(.iw-row-align-between, .iw-row-align-evenly) > .internal-embed:only-child { margin-inline: auto; }
 p.iw-row.iw-row-valign-top { align-items: flex-start; }
 p.iw-row.iw-row-valign-center { align-items: center; }
 p.iw-row.iw-row-valign-bottom { align-items: flex-end; }
+
+/* Keep feedback inside the image bounds: native embed containers may clip
+   external outlines. Negative offsets preserve layout and resize geometry. */
+.markdown-source-view.mod-cm6 .iw-image-feedback img:hover {
+	outline: 2px solid var(--text-muted);
+	outline-offset: -2px;
+}
+
+.markdown-source-view.mod-cm6 .iw-image-feedback.iw-image-active img {
+	outline: 3px solid var(--interactive-accent);
+	outline-offset: -3px;
+}
+
+/* The wrap's image while its handle is dragged: it fills the width the gesture
+   sets (--iw-resize-width, wrap-resize.ts), the one the release will save. */
+.iw-preview .iw-preview-content .image-embed.iw-resizing img { width: 100%; }
+
+/* Activate known layout before renderer callbacks annotate individual embeds. */
+:is(.iw-layout-iw-left, .iw-layout-iw-right) :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > :is(p, .iw-image-carrier):first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > :is(p, .iw-image-carrier):first-child > .image-embed:first-child) {
+	width: var(--iw-resize-width, max-content);
+	max-width: var(--iw-wrap-max, 45%);
+	margin-block: 0 0.25em;
+}
+
+.iw-layout-iw-left :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > :is(p, .iw-image-carrier):first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > :is(p, .iw-image-carrier):first-child > .image-embed:first-child) {
+	float: left;
+	margin-inline: 0 var(--iw-wrap-gap, 1em);
+}
+
+.iw-layout-iw-right :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > :is(p, .iw-image-carrier):first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > :is(p, .iw-image-carrier):first-child > .image-embed:first-child) {
+	float: right;
+	margin-inline: var(--iw-wrap-gap, 1em) 0;
+}
+
+:is(.iw-layout-iw-left, .iw-layout-iw-right) :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > :is(p, .iw-image-carrier):first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > :is(p, .iw-image-carrier):first-child > .image-embed:first-child) img {
+	max-width: 100%;
+	height: auto;
+	vertical-align: top;
+}
+:is(.iw-layout-iw-left, .iw-layout-iw-right) :is(.iw-preview-content > .image-embed:first-child, .iw-preview-content > :is(p, .iw-image-carrier):first-child > .image-embed:first-child, .iw-preview-content > .el-p:first-child > :is(p, .iw-image-carrier):first-child > .image-embed:first-child) + br { display: none; }
 
 /* Row and wrap bars (Live Preview only): an overlay in the top corner, shown on
    hover or keyboard focus. It never takes space, so the height does not change.
@@ -224,6 +325,7 @@ p.iw-row.iw-row-valign-bottom { align-items: flex-end; }
    form, with the fix button) in the theme's orange. */
 .iw-block-toolbar {
 	--iw-bar-color: var(--interactive-accent);
+
 	position: absolute;
 	top: 4px;
 	right: 4px;
@@ -237,28 +339,48 @@ p.iw-row.iw-row-valign-bottom { align-items: flex-end; }
 	box-shadow: var(--shadow-s);
 	opacity: 0;
 	pointer-events: none;
+
 	/* No tooltip of its own (its name is for screen readers), nor the block's
 	   over its edges and gaps (block-toolbar.ts); the buttons keep theirs. */
 	--no-tooltip: true;
 }
 .iw-block-toolbar.mod-compact { --iw-bar-color: var(--color-orange, #e0701b); }
 .iw-block-toolbar.mod-compact .mod-fix { color: var(--iw-bar-color); }
+
 .iw-layout-iw-right > .iw-block-toolbar,
-.iw-row-preview.mod-align-right > .iw-block-toolbar { right: auto; left: 4px; }
+.iw-row-preview.mod-align-right > .iw-block-toolbar {
+	right: auto;
+	left: 4px;
+}
+
 .iw-preview:hover > .iw-block-toolbar,
-.iw-preview:focus-within > .iw-block-toolbar { opacity: 1; pointer-events: auto; }
-.iw-block-toolbar-button { width: 26px; height: 26px; padding: 3px; --no-tooltip: initial; }
-.iw-block-toolbar-button svg { width: 18px; height: 18px; }
+.iw-preview:focus-within > .iw-block-toolbar {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+.iw-block-toolbar-button {
+	width: 26px;
+	height: 26px;
+	padding: 3px;
+
+	--no-tooltip: initial;
+}
+
+.iw-block-toolbar-button svg {
+	width: 18px;
+	height: 18px;
+}
+
 /* The wrap's move handle is dragged, not clicked. */
 .iw-block-toolbar-button.mod-move { cursor: grab; }
 body.iw-gesture.iw-block-moving, body.iw-gesture.iw-block-moving * { cursor: grabbing; }
-body.iw-gesture.iw-block-moving.iw-drag-forbidden, body.iw-gesture.iw-block-moving.iw-drag-forbidden * { cursor: not-allowed; }
 
 /* Resize handles (Live Preview): a thin bar on the moving edge of each image
    of a row, and of the image of a wrap, shown on hover. The gestures are in
    row-resize-handle.ts and wrap-resize.ts. */
-.iw-row-preview p.iw-row > .internal-embed { position: relative; }
 .iw-preview .image-embed:is(.iw-left, .iw-right) { position: relative; }
+
 .iw-row-handle,
 .iw-wrap-handle {
 	position: absolute;
@@ -270,8 +392,13 @@ body.iw-gesture.iw-block-moving.iw-drag-forbidden, body.iw-gesture.iw-block-movi
 	cursor: ew-resize;
 	touch-action: none;
 }
+
 .iw-row-handle.mod-left,
-.iw-wrap-handle.mod-left { right: auto; left: -5px; }
+.iw-wrap-handle.mod-left {
+	right: auto;
+	left: -5px;
+}
+
 .iw-row-handle::after,
 .iw-wrap-handle::after {
 	content: '';
@@ -281,6 +408,7 @@ body.iw-gesture.iw-block-moving.iw-drag-forbidden, body.iw-gesture.iw-block-movi
 	left: 3px;
 	width: 4px;
 	border-radius: 2px;
+
 	/* Not the accent: hover is grey, selection is the accent, the handle is its
 	   own colour so the three never look alike. The ring keeps it visible on
 	   any image. */
@@ -288,24 +416,47 @@ body.iw-gesture.iw-block-moving.iw-drag-forbidden, body.iw-gesture.iw-block-movi
 	box-shadow: 0 0 0 1px var(--background-primary);
 	opacity: 0;
 }
-.iw-row-preview p.iw-row > .internal-embed:hover > .iw-row-handle::after,
+
 .iw-row-handle:hover::after,
 .iw-row-handle.iw-resizing::after,
-.iw-preview .image-embed:hover > .iw-wrap-handle::after,
 .iw-wrap-handle:hover::after,
-.image-embed.iw-resizing > .iw-wrap-handle::after { opacity: 1; }
+.image-embed.iw-resizing > .iw-wrap-handle::after,
+.iw-row-preview p.iw-row > .internal-embed:hover > .iw-row-handle::after,
+.iw-preview .image-embed:hover > .iw-wrap-handle::after { opacity: 1; }
+
 /* During a resize the pressed handle alone shows its bar (above); the body
    class gives the cursor everywhere, the pointer leaving the handle. */
 body.iw-gesture.iw-row-resizing, body.iw-gesture.iw-row-resizing *,
 body.iw-gesture.iw-wrap-resizing, body.iw-gesture.iw-wrap-resizing * { cursor: ew-resize; }
+
+/* Keep the hidden native sections measurable for Reading virtualization,
+   without rendering their text or introducing a float boundary. */
+.markdown-reading-view .markdown-preview-view :is(.iw-marker-hidden, .iw-section-hidden) {
+	display: block;
+	visibility: hidden;
+	height: 1px;
+	min-height: 1px;
+	margin: 0;
+	padding: 0;
+	border: 0;
+	font-size: 0;
+	line-height: 0;
+}
+
+.markdown-reading-view .markdown-preview-view :is(.iw-marker-hidden, .iw-section-hidden) > * {
+	display: none;
+}
+
+/* A refused drop while a block is moved: more specific than the moving
+   cursor above, so it wins whatever the order. */
+body.iw-gesture.iw-block-moving.iw-drag-forbidden, body.iw-gesture.iw-block-moving.iw-drag-forbidden * { cursor: not-allowed; }
+
 /* While an image is pressed to be moved, its handles are not an option. */
 body.iw-image-dragging :is(.iw-row-handle, .iw-wrap-handle) { display: none; }
+
 /* No tooltips during a gesture (pointer-gesture.ts): Obsidian reads
    --no-tooltip before showing one on hover, and one already pending or open
    stays out of sight. */
 body.iw-gesture,
 body.iw-gesture .iw-block-toolbar-button { --no-tooltip: true; }
 body.iw-gesture > .tooltip { display: none; }
-/* The wrap's image while its handle is dragged: it fills the width the gesture
-   sets (--iw-resize-width, wrap-resize.ts), the one the release will save. */
-.iw-preview .iw-preview-content .image-embed.iw-resizing img { width: 100%; }

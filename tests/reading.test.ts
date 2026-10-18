@@ -9,16 +9,25 @@ import { parseDocument } from '../src/markdown/model';
 
 // Minimal DOM/event stand-ins, not a browser or a CSS/layout test.
 class Element {
+	isConnected = true;
 	parentElement: Element | null = null;
 	children: Element[] = [];
-	childNodes: { nodeType: number; textContent: string }[] = [];
+	nodeType = 1;
+	textContent = '';
+	childNodes: (Element | { nodeType: number; textContent: string })[] = [];
+	ownerDocument = { createElement: (tag: string) => new Element(tag.toUpperCase()) };
 	classes = new Set<string>();
 	classList = {
 		contains: (name: string) => this.classes.has(name),
 		add: (...names: string[]) => names.forEach(name => this.classes.add(name)),
 		remove: (...names: string[]) => names.forEach(name => this.classes.delete(name)),
 	};
-	attributes = new Map<string, string>();
+	attributeValues = new Map<string, string>();
+ attributes = {
+  set: (name: string, value: string) => this.attributeValues.set(name, value),
+  get: (name: string) => this.attributeValues.get(name),
+  [Symbol.iterator]: () => Array.from(this.attributeValues, ([name, value]) => ({name, value}))[Symbol.iterator](),
+ };
 	properties = new Map<string, string>();
 	style = {
 		setProperty: (name: string, value: string) => this.properties.set(name, value),
@@ -30,7 +39,29 @@ class Element {
 		for (const [name, value] of Object.entries(props)) { if (value) this.properties.set(name, value); else this.properties.delete(name); }
 	}
 	constructor(readonly tagName = 'DIV', classes = '') { for (const name of classes.split(' ').filter(Boolean)) this.classes.add(name); }
-	append(element: Element) { element.parentElement = this; this.children.push(element); return element; }
+	append(element: Element): Element;
+ append(...elements: (Element | {nodeType: number; textContent: string})[]): Element | undefined;
+ append(...elements: (Element | {nodeType: number; textContent: string})[]) {
+  for (const element of elements) {
+   if (element instanceof Element) { element.remove(); element.parentElement = this; this.children.push(element); }
+   this.childNodes.push(element);
+  }
+  return elements[0] instanceof Element ? elements[0] : undefined;
+ }
+ remove() {
+  const parent = this.parentElement;
+  if (parent) { parent.children = parent.children.filter(child => child !== this); parent.childNodes = parent.childNodes.filter(child => child !== this); }
+  this.parentElement = null;
+ }
+ before(element: Element) {
+  const parent = this.parentElement; if (!parent) return;
+  element.remove(); element.parentElement = parent;
+  parent.children.splice(parent.children.indexOf(this), 0, element);
+  parent.childNodes.splice(parent.childNodes.indexOf(this), 0, element);
+ }
+ replaceWith(element: Element) { this.before(element); this.remove(); }
+ setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+ get parentNode() { return this.parentElement; }
 	matches(selector: string): boolean {
 		return selector.split(',').some(part => part.trim().startsWith('.') ? this.classes.has(part.trim().slice(1)) : this.tagName.toLowerCase() === part.trim());
 	}
@@ -73,7 +104,7 @@ test('Reading view annotates an image inserted after the postprocessor ran', () 
 		embed.attributes.set('src', 'foto.png');
 		observer.flush();
 		assert.ok(embed.classes.has('iw-left'));
-		assert.ok(paragraph.classes.has('iw-image-paragraph'));
+		assert.ok(embed.parentElement?.classes.has('iw-image-paragraph'));
 		observer.flush();
 		assert.ok(embed.classes.has('iw-left'));
 		f.plugin.unload();
@@ -174,9 +205,10 @@ test('Preview removes only the image-only paragraph box and the first text top m
 	const first = root.append(new Element('P'));
 	const second = root.append(new Element('P'));
 	alignPreviewParagraphs(root.dom, embed.dom, (element, cls) => element.classList.add(cls));
-	assert.ok(imageParagraph.classes.has('iw-image-paragraph'));
+	assert.ok(embed.parentElement?.classes.has('iw-image-paragraph'));
 	assert.ok(first.classes.has('iw-first-paragraph'));
 	assert.ok(!second.classes.has('iw-first-paragraph'));
+	imageParagraph.append(embed);
 	imageParagraph.classes.clear();
 	imageParagraph.childNodes.push({ nodeType: 3, textContent: 'Caption to preserve' });
 	alignPreviewParagraphs(root.dom, embed.dom, (element, cls) => element.classList.add(cls));

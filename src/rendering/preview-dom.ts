@@ -58,7 +58,7 @@ function renderedKind(element: Element): string {
 	// A table may sit in a wrapper of its own.
 	return is('.callout') ? 'callout' : is('h1, h2, h3, h4, h5, h6') ? 'heading' : is('pre') ? 'code'
 		: is('table') || shown.querySelector(':scope > table') ? 'table'
-		: is('ul, ol') ? 'list' : is('blockquote') ? 'blockquote' : is('p') ? 'paragraph' : 'other';
+		: is('ul, ol') ? 'list' : is('blockquote') ? 'blockquote' : is('p, .iw-image-carrier') ? 'paragraph' : 'other';
 }
 
 // The items of a drawn list or table, in source order.
